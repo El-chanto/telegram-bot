@@ -1,4 +1,3 @@
-// wizard.js
 const { Scenes } = require("telegraf");
 const axios = require("axios");
 const { depositAddresses, addressValidators } = require("./config");
@@ -16,6 +15,67 @@ const CG_ID = {
   DOGE: "dogecoin",
 };
 
+// helper: get text safely from different update types
+function getText(ctx) {
+  if (ctx.message && ctx.message.text) return ctx.message.text;
+  if (ctx.update && ctx.update.callback_query && ctx.update.callback_query.data)
+    return ctx.update.callback_query.data;
+  return "";
+}
+
+// helper: canonical escrow key per chat or fallback to user
+function escrowKey(ctx) {
+  return String((ctx.chat && ctx.chat.id) || (ctx.from && ctx.from.id) || "unknown");
+}
+
+// simple in-memory cache and retry helper for CoinGecko
+const priceCache = {}; // { key: { price, expiresAt } }
+
+async function fetchPriceWithCache(id, opts = {}) {
+  const key = id;
+  const now = Date.now();
+  const ttl = opts.ttlMs || 60000; // default 60s cache (increase to reduce 429s)
+
+  const cached = priceCache[key];
+  if (cached && cached.expiresAt > now) return cached.price;
+
+  const maxRetries = typeof opts.retries === "number" ? opts.retries : 2;
+  let attempt = 0;
+  let lastErr;
+  while (attempt <= maxRetries) {
+    try {
+      const resp = await axios.get("https://api.coingecko.com/api/v3/simple/price", {
+        params: { ids: id, vs_currencies: "usd" },
+        timeout: 5000,
+        headers: { "User-Agent": "BitSafeEscrowBot/1.0 (+https://yourdomain.example)" },
+        validateStatus: (s) => s < 500 || s === 429,
+      });
+
+      if (resp.status === 429) {
+        lastErr = new Error("Rate limited by CoinGecko");
+        lastErr.status = 429;
+        throw lastErr;
+      }
+
+      const price = resp.data && resp.data[id] && resp.data[id].usd;
+      if (!price || typeof price !== "number" || price <= 0) {
+        lastErr = new Error("Invalid price returned");
+        throw lastErr;
+      }
+
+      priceCache[key] = { price, expiresAt: Date.now() + ttl };
+      return price;
+    } catch (err) {
+      lastErr = err;
+      attempt += 1;
+      if (attempt > maxRetries) break;
+      const backoffMs = err && err.status === 429 ? 3000 * attempt : 200 * Math.pow(2, attempt);
+      await new Promise((res) => setTimeout(res, backoffMs));
+    }
+  }
+  throw lastErr;
+}
+
 const createEscrowWizard = new Scenes.WizardScene(
   "create-escrow",
 
@@ -32,7 +92,7 @@ const createEscrowWizard = new Scenes.WizardScene(
 
   // Step 2/9: Coin symbol
   async (ctx) => {
-    const handle = ctx.message.text.trim();
+    const handle = getText(ctx).trim();
     if (!/^@[A-Za-z0-9_]{5,32}$/.test(handle)) {
       return ctx.reply(
         `*❌ Invalid Handle*\n\n` +
@@ -56,10 +116,10 @@ const createEscrowWizard = new Scenes.WizardScene(
 
   // Step 3/9: USD amount prompt
   async (ctx) => {
-    const currency = ctx.message.text.trim().toUpperCase();
+    const currency = getText(ctx).trim().toUpperCase();
     if (!CG_ID[currency]) {
       return ctx.reply(
-        `*❌ Unsupported coin\n\n*` +
+        `*❌ Unsupported coin*\n\n` +
           `💱  Please choose one of the supported coins \n` +
           `💰 Supported: ${Object.keys(CG_ID).join(" • ")}\n\n` +
           `🔁 Please try again.`,
@@ -78,7 +138,7 @@ const createEscrowWizard = new Scenes.WizardScene(
 
   // Step 4/9: Fetch price, compute crypto & ID, summary
   async (ctx) => {
-    const usdAmount = parseFloat(ctx.message.text.trim());
+    const usdAmount = parseFloat(getText(ctx).trim());
     if (isNaN(usdAmount) || usdAmount <= 0) {
       return ctx.reply(
         `*❌ Invalid USD amount*\n\n` +
@@ -92,21 +152,12 @@ const createEscrowWizard = new Scenes.WizardScene(
     e.usdAmount = usdAmount;
 
     try {
-      const { data } = await axios.get(
-        "https://api.coingecko.com/api/v3/simple/price",
-        {
-          params: {
-            ids: CG_ID[e.currency],
-            vs_currencies: "usd",
-          },
-        },
-      );
-      const price = data[CG_ID[e.currency]].usd;
+      const price = await fetchPriceWithCache(CG_ID[e.currency], { ttlMs: 60000, retries: 2 });
       e.cryptoAmount = (usdAmount / price).toFixed(8);
       e.id = Date.now().toString().slice(-6);
 
       await ctx.reply(
-        `*📋 Escrow #${e.id}*\n\n.` +
+        `*📋 Escrow #${e.id}*\n\n` +
           `👤 Seller: ${e.sellerHandle}\n` +
           `💱 Coin: ${e.currency}\n` +
           `💵 Trade Size: $${e.usdAmount} → ${e.cryptoAmount} ${e.currency}`,
@@ -120,7 +171,7 @@ const createEscrowWizard = new Scenes.WizardScene(
       );
       return ctx.wizard.next();
     } catch (err) {
-      console.error(err);
+      console.error("CoinGecko fetch failed:", { message: err.message, status: err.status });
       return ctx.reply(
         `*❌ Failed to fetch price*\n\n` + `⏳ Please try again later`,
         { parse_mode: "Markdown" },
@@ -130,9 +181,9 @@ const createEscrowWizard = new Scenes.WizardScene(
 
   // Step 5/9: Seller’s deposit address
   async (ctx) => {
-    const addr = ctx.message.text.trim();
+    const addr = getText(ctx).trim();
     const validate = addressValidators[ctx.wizard.state.escrow.currency];
-    if (!validate(addr)) {
+    if (typeof validate !== "function" || !validate(addr)) {
       return ctx.reply(
         `*❌ Invalid Deposit Address*\n\n` +
           `🏦 Please try again with a valid on‑chain address`,
@@ -150,9 +201,9 @@ const createEscrowWizard = new Scenes.WizardScene(
 
   // Step 6/9: Buyer’s refund address + interim summary
   async (ctx) => {
-    const addr = ctx.message.text.trim();
+    const addr = getText(ctx).trim();
     const validate = addressValidators[ctx.wizard.state.escrow.currency];
-    if (!validate(addr)) {
+    if (typeof validate !== "function" || !validate(addr)) {
       return ctx.reply(
         `*❌ Invalid Refund Address*\n\n` +
           `🏦 Please try again with a valid on‑chain address`,
@@ -163,7 +214,7 @@ const createEscrowWizard = new Scenes.WizardScene(
 
     const e = ctx.wizard.state.escrow;
     await ctx.reply(
-      `*📜 Trade details for Escrow #${e.id}*\n\n.` +
+      `*📜 Trade details for Escrow #${e.id}*\n\n` +
         `👤 Seller: ${e.sellerHandle}\n` +
         `💱 Coin: ${e.currency}\n` +
         `💵 Trade Size: $${e.usdAmount} → ${e.cryptoAmount} ${e.currency}\n` +
@@ -187,8 +238,8 @@ const createEscrowWizard = new Scenes.WizardScene(
 
   // Step 7/9: TXID entry
   async (ctx) => {
-    const txid = ctx.message.text.trim();
-    if (!/^[A-Fa-f0-9]{6,}$/.test(txid)) {
+    const txid = getText(ctx).trim();
+    if (!txid || txid.length < 6) {
       return ctx.reply(
         `*❌ Invalid TXID*\n\n` + `🔗 Please paste the full transaction hash`,
         { parse_mode: "Markdown" },
@@ -197,8 +248,11 @@ const createEscrowWizard = new Scenes.WizardScene(
     ctx.wizard.state.escrow.txid = txid;
 
     // Persist final escrow
-    if (!ctx.session.escrows) ctx.session.escrows = {};
-    ctx.session.escrows[ctx.chat.id] = ctx.wizard.state.escrow;
+    ctx.session = ctx.session || {};
+    ctx.session.escrows = ctx.session.escrows || {};
+    ctx.session.escrows[escrowKey(ctx)] = ctx.wizard.state.escrow;
+
+    console.log("Persisted escrow for", escrowKey(ctx), ctx.wizard.state.escrow);
 
     await ctx.reply("🎉 Funds detected! Generating final confirmation…");
     return ctx.wizard.next();
@@ -223,6 +277,10 @@ const createEscrowWizard = new Scenes.WizardScene(
 
 // scene-level cancel handler
 createEscrowWizard.command("cancel", async (ctx) => {
+  // remove any persisted escrow for this chat
+  if (ctx.session && ctx.session.escrows) {
+    delete ctx.session.escrows[escrowKey(ctx)];
+  }
   await ctx.reply(
     `*🛑 Operation Canceled* \n` +
       `🗑️ All escrow data has been cleared.\n\n` +
