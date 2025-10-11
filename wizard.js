@@ -3,61 +3,65 @@ const { Scenes } = require("telegraf");
 const axios = require("axios");
 const { depositAddresses, addressValidators } = require("./config");
 
-// CoinCap lookup map
-const CC_ID = {
-  BTC: "bitcoin",
-  ETH: "ethereum",
-  USDT: "tether",
-  TRX: "tron",
-  LTC: "litecoin",
-  XRP: "ripple",
-  TON: "ton", // confirm if CoinCap uses "ton" or "toncoin" and adjust if needed
-  SOL: "solana",
-  DOGE: "dogecoin",
+// Binance pair lookup map
+const BINANCE_PAIR = {
+  BTC: "BTCUSDT",
+  ETH: "ETHUSDT",
+  USDT: "USDTUSDT", // handled specially below
+  TRX: "TRXUSDT",
+  LTC: "LTCUSDT",
+  XRP: "XRPUSDT",
+  TON: "TONUSDT", // Binance symbol for Toncoin; adjust if your environment differs
+  SOL: "SOLUSDT",
+  DOGE: "DOGEUSDT",
 };
 
 // Simple in-memory short cache to reduce API calls
-const priceCache = {}; // { coinIdOrSymbol: { price: number, ts: epoch_ms } }
+const priceCache = {}; // { pair: { price: number, ts: epoch_ms } }
 const CACHE_TTL = 30 * 1000; // 30 seconds
 
-async function fetchPriceWithRetry(coinSymbol, attempts = 3) {
-  if (!coinSymbol) throw new Error("Missing coinSymbol");
+async function fetchPriceWithRetry(symbol, attempts = 3) {
+  if (!symbol) throw new Error("Missing symbol");
 
-  const coinId = CC_ID[coinSymbol];
-  if (!coinId) throw new Error(`Missing CoinCap id mapping for ${coinSymbol}`);
+  // Special-case stablecoin: USDT ~ 1 USD
+  if (symbol === "USDT") {
+    return 1;
+  }
+
+  const pair = BINANCE_PAIR[symbol];
+  if (!pair) throw new Error(`Missing Binance pair mapping for ${symbol}`);
 
   const now = Date.now();
-  const cached = priceCache[coinId];
+  const cached = priceCache[pair];
   if (cached && now - cached.ts < CACHE_TTL) {
-    console.log(`Using cached price for ${coinId}: ${cached.price}`);
+    console.log(`Using cached price for ${pair}: ${cached.price}`);
     return cached.price;
   }
 
-  const url = `https://api.coincap.io/v2/assets/${encodeURIComponent(coinId)}`;
+  const url = `https://api.binance.com/api/v3/ticker/price`;
+  const params = { symbol: pair };
   const headers = { "User-Agent": "EscrowBot/1.0", Accept: "application/json" };
 
   let lastErr;
   for (let i = 0; i < attempts; i++) {
     try {
-      const { data } = await axios.get(url, { timeout: 5000, headers });
-      console.log("CoinCap raw response:", JSON.stringify(data));
-      if (!data || !data.data || typeof data.data.priceUsd === "undefined") {
-        throw new Error(`Invalid response shape for ${coinId}`);
+      const { data } = await axios.get(url, { params, timeout: 5000, headers });
+      console.log("Binance raw response:", JSON.stringify(data));
+      if (!data || typeof data.price === "undefined") {
+        throw new Error(`Invalid response shape for ${pair}`);
       }
-      const price = parseFloat(data.data.priceUsd);
-      if (!price || typeof price !== "number" || isNaN(price) || price <= 0) {
-        throw new Error(`Invalid price value from CoinCap for ${coinId}: ${data.data.priceUsd}`);
+      const price = parseFloat(data.price);
+      if (!price || isNaN(price) || price <= 0) {
+        throw new Error(`Invalid price value from Binance for ${pair}: ${data.price}`);
       }
-      priceCache[coinId] = { price, ts: Date.now() };
+      priceCache[pair] = { price, ts: Date.now() };
       return price;
     } catch (err) {
       lastErr = err;
       const status = err.response?.status;
       const msg = err.response?.data || err.message || err;
-      console.error(`CoinCap attempt ${i + 1} failed for ${coinId}:`, status || "", msg);
-      // If rate limited, break and return lastErr quickly so caller can decide
+      console.error(`Binance attempt ${i + 1} failed for ${pair}:`, status || "", msg);
       if (status === 429) break;
-      // exponential backoff before retrying
       const backoff = 200 * Math.pow(2, i);
       await new Promise((res) => setTimeout(res, backoff));
     }
@@ -96,7 +100,7 @@ const createEscrowWizard = new Scenes.WizardScene(
     await ctx.reply(
       `*🔹 Step 2/9*\n\n` +
         `🏷️ Listed Currencies:\n` +
-        `*${Object.keys(CC_ID).join(" • ")}*\n\n` +
+        `*${Object.keys(BINANCE_PAIR).join(" • ")}*\n\n` +
         `💰 Enter the coin currency you wish to trade.`,
       { parse_mode: "Markdown" },
     );
@@ -106,11 +110,11 @@ const createEscrowWizard = new Scenes.WizardScene(
   // Step 3/9: USD amount prompt
   async (ctx) => {
     const currency = ctx.message.text.trim().toUpperCase();
-    if (!CC_ID[currency]) {
+    if (!BINANCE_PAIR[currency]) {
       return ctx.reply(
         `*❌ Unsupported coin*\n\n` +
           `💱  Please choose one of the supported coins \n` +
-          `💰 Supported: ${Object.keys(CC_ID).join(" • ")}\n\n` +
+          `💰 Supported: ${Object.keys(BINANCE_PAIR).join(" • ")}\n\n` +
           `🔁 Please try again.`,
         { parse_mode: "Markdown" },
       );
