@@ -2,15 +2,15 @@ const { Scenes } = require("telegraf");
 const axios = require("axios");
 const { depositAddresses, addressValidators } = require("./config");
 
-// CoinGecko lookup map
-const CG_ID = {
+// CoinCap lookup map (asset ids used by CoinCap)
+const CC_ID = {
   BTC: "bitcoin",
   ETH: "ethereum",
   USDT: "tether",
   TRX: "tron",
   LTC: "litecoin",
   XRP: "ripple",
-  TON: "the-open-network",
+  TON: "toncoin",
   SOL: "solana",
   DOGE: "dogecoin",
 };
@@ -28,7 +28,7 @@ function escrowKey(ctx) {
   return String((ctx.chat && ctx.chat.id) || (ctx.from && ctx.from.id) || "unknown");
 }
 
-// simple in-memory cache and retry helper for CoinGecko
+// simple in-memory cache and retry helper for CoinCap
 const priceCache = {}; // { key: { price, expiresAt } }
 
 async function fetchPriceWithCache(id, opts = {}) {
@@ -44,22 +44,24 @@ async function fetchPriceWithCache(id, opts = {}) {
   let lastErr;
   while (attempt <= maxRetries) {
     try {
-      const resp = await axios.get("https://api.coingecko.com/api/v3/simple/price", {
-        params: { ids: id, vs_currencies: "usd" },
+      // CoinCap single-asset endpoint
+      const url = `https://api.coincap.io/v2/assets/${encodeURIComponent(id)}`;
+      const resp = await axios.get(url, {
         timeout: 5000,
         headers: { "User-Agent": "BitSafeEscrowBot/1.0 (+https://yourdomain.example)" },
         validateStatus: (s) => s < 500 || s === 429,
       });
 
       if (resp.status === 429) {
-        lastErr = new Error("Rate limited by CoinGecko");
+        lastErr = new Error("Rate limited by CoinCap");
         lastErr.status = 429;
         throw lastErr;
       }
 
-      const price = resp.data && resp.data[id] && resp.data[id].usd;
-      if (!price || typeof price !== "number" || price <= 0) {
-        lastErr = new Error("Invalid price returned");
+      const raw = resp.data && resp.data.data;
+      const price = raw && raw.priceUsd ? parseFloat(raw.priceUsd) : NaN;
+      if (!price || Number.isNaN(price) || price <= 0) {
+        lastErr = new Error("Invalid price returned from CoinCap");
         throw lastErr;
       }
 
@@ -107,7 +109,7 @@ const createEscrowWizard = new Scenes.WizardScene(
     await ctx.reply(
       `*🔹 Step 2/9*\n\n` +
         `🏷️ Listed Currencies:\n` +
-        `*${Object.keys(CG_ID).join(" • ")}*\n\n` +
+        `*${Object.keys(CC_ID).join(" • ")}*\n\n` +
         `💰 Enter the coin currency you wish to trade.`,
       { parse_mode: "Markdown" },
     );
@@ -117,11 +119,11 @@ const createEscrowWizard = new Scenes.WizardScene(
   // Step 3/9: USD amount prompt
   async (ctx) => {
     const currency = getText(ctx).trim().toUpperCase();
-    if (!CG_ID[currency]) {
+    if (!CC_ID[currency]) {
       return ctx.reply(
         `*❌ Unsupported coin*\n\n` +
           `💱  Please choose one of the supported coins \n` +
-          `💰 Supported: ${Object.keys(CG_ID).join(" • ")}\n\n` +
+          `💰 Supported: ${Object.keys(CC_ID).join(" • ")}\n\n` +
           `🔁 Please try again.`,
         { parse_mode: "Markdown" },
       );
@@ -152,7 +154,7 @@ const createEscrowWizard = new Scenes.WizardScene(
     e.usdAmount = usdAmount;
 
     try {
-      const price = await fetchPriceWithCache(CG_ID[e.currency], { ttlMs: 30000, retries: 2 });
+      const price = await fetchPriceWithCache(CC_ID[e.currency], { ttlMs: 30000, retries: 2 });
       e.cryptoAmount = (usdAmount / price).toFixed(8);
       e.id = Date.now().toString().slice(-6);
 
@@ -171,7 +173,7 @@ const createEscrowWizard = new Scenes.WizardScene(
       );
       return ctx.wizard.next();
     } catch (err) {
-      console.error("CoinGecko fetch failed:", { message: err.message, status: err.status });
+      console.error("CoinCap fetch failed:", { message: err && err.message, status: err && err.status });
       return ctx.reply(
         `*❌ Failed to fetch price*\n\n` + `⏳ Please try again later`,
         { parse_mode: "Markdown" },
