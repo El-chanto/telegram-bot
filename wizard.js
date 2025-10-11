@@ -48,7 +48,7 @@ async function fetchPriceWithCache(id, opts = {}) {
       const url = `https://api.coincap.io/v2/assets/${encodeURIComponent(id)}`;
       const resp = await axios.get(url, {
         timeout: 5000,
-        headers: { "User-Agent": "BitSafeEscrowBot/1.0 (+https://yourdomain.example)" },
+        headers: { "User-Agent": "BitSafeEscrowBot/1.0 (+https://telegram-bot-zqku.onrender.com)" },
         validateStatus: (s) => s < 500 || s === 429,
       });
 
