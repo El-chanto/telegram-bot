@@ -34,12 +34,12 @@ const priceCache = {}; // { key: { price, expiresAt } }
 async function fetchPriceWithCache(id, opts = {}) {
   const key = id;
   const now = Date.now();
-  const ttl = opts.ttlMs || 60000; // default 60s cache (increase to reduce 429s)
+  const ttl = opts.ttlMs || 30000; // default 30s cache
 
   const cached = priceCache[key];
   if (cached && cached.expiresAt > now) return cached.price;
 
-  const maxRetries = typeof opts.retries === "number" ? opts.retries : 2;
+  const maxRetries = opts.retries || 2;
   let attempt = 0;
   let lastErr;
   while (attempt <= maxRetries) {
@@ -69,7 +69,7 @@ async function fetchPriceWithCache(id, opts = {}) {
       lastErr = err;
       attempt += 1;
       if (attempt > maxRetries) break;
-      const backoffMs = err && err.status === 429 ? 3000 * attempt : 200 * Math.pow(2, attempt);
+      const backoffMs = err && err.status === 429 ? 1500 * attempt : 200 * Math.pow(2, attempt);
       await new Promise((res) => setTimeout(res, backoffMs));
     }
   }
@@ -152,7 +152,7 @@ const createEscrowWizard = new Scenes.WizardScene(
     e.usdAmount = usdAmount;
 
     try {
-      const price = await fetchPriceWithCache(CG_ID[e.currency], { ttlMs: 60000, retries: 2 });
+      const price = await fetchPriceWithCache(CG_ID[e.currency], { ttlMs: 30000, retries: 2 });
       e.cryptoAmount = (usdAmount / price).toFixed(8);
       e.id = Date.now().toString().slice(-6);
 
@@ -251,8 +251,6 @@ const createEscrowWizard = new Scenes.WizardScene(
     ctx.session = ctx.session || {};
     ctx.session.escrows = ctx.session.escrows || {};
     ctx.session.escrows[escrowKey(ctx)] = ctx.wizard.state.escrow;
-
-    console.log("Persisted escrow for", escrowKey(ctx), ctx.wizard.state.escrow);
 
     await ctx.reply("🎉 Funds detected! Generating final confirmation…");
     return ctx.wizard.next();
