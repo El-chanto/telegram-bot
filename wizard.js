@@ -3,70 +3,133 @@ const { Scenes } = require("telegraf");
 const axios = require("axios");
 const { depositAddresses, addressValidators } = require("./config");
 
-// Binance pair lookup map
-const BINANCE_PAIR = {
-  BTC: "BTCUSDT",
-  ETH: "ETHUSDT",
-  USDT: "USDTUSDT", // handled specially below
-  TRX: "TRXUSDT",
-  LTC: "LTCUSDT",
-  XRP: "XRPUSDT",
-  TON: "TONUSDT", // Binance symbol for Toncoin; adjust if your environment differs
-  SOL: "SOLUSDT",
-  DOGE: "DOGEUSDT",
+// Provider maps and config
+const SYMBOLS = {
+  BTC: { binance: "BTCUSDT", coincap: "bitcoin", coinpaprika: "btc-bitcoin", coingecko: "bitcoin" },
+  ETH: { binance: "ETHUSDT", coincap: "ethereum", coinpaprika: "eth-ethereum", coingecko: "ethereum" },
+  USDT: { binance: "USDTUSDT", coincap: "tether", coinpaprika: "usdt-tether", coingecko: "tether" },
+  TRX: { binance: "TRXUSDT", coincap: "tron", coinpaprika: "trx-tron", coingecko: "tron" },
+  LTC: { binance: "LTCUSDT", coincap: "litecoin", coinpaprika: "ltc-litecoin", coingecko: "litecoin" },
+  XRP: { binance: "XRPUSDT", coincap: "ripple", coinpaprika: "xrp-xrp", coingecko: "ripple" },
+  TON: { binance: "TONUSDT", coincap: "ton", coinpaprika: "ton-toncoin", coingecko: "the-open-network" },
+  SOL: { binance: "SOLUSDT", coincap: "solana", coinpaprika: "sol-solana", coingecko: "solana" },
+  DOGE: { binance: "DOGEUSDT", coincap: "dogecoin", coinpaprika: "doge-dogecoin", coingecko: "dogecoin" },
 };
 
 // Simple in-memory short cache to reduce API calls
-const priceCache = {}; // { pair: { price: number, ts: epoch_ms } }
+const priceCache = {}; // { key: { price: number, ts: epoch_ms } }
 const CACHE_TTL = 30 * 1000; // 30 seconds
 
-async function fetchPriceWithRetry(symbol, attempts = 3) {
+// Environment-configurable API keys (optional)
+const COINPAPRIKA_KEY = process.env.COINPAPRIKA_KEY || null; // coinpaprika optional
+const COINGECKO_KEY = process.env.COINGECKO_KEY || null; // coingecko optional (if on paid plan)
+// Note: Binance & CoinCap public endpoints used without keys; if blocked, use a keyed provider.
+
+async function tryBinance(pair) {
+  if (!pair) throw new Error("Missing binance pair");
+  const url = `https://api.binance.com/api/v3/ticker/price`;
+  const params = { symbol: pair };
+  const { data } = await axios.get(url, { params, timeout: 5000, headers: { "User-Agent": "EscrowBot/1.0" } });
+  if (!data || typeof data.price === "undefined") throw new Error("Invalid Binance response");
+  const p = parseFloat(data.price);
+  if (!p || isNaN(p) || p <= 0) throw new Error("Invalid price from Binance");
+  return p;
+}
+
+async function tryCoinCap(id) {
+  if (!id) throw new Error("Missing coincap id");
+  const url = `https://api.coincap.io/v2/assets/${encodeURIComponent(id)}`;
+  const { data } = await axios.get(url, { timeout: 5000, headers: { "User-Agent": "EscrowBot/1.0" } });
+  if (!data || !data.data || typeof data.data.priceUsd === "undefined") throw new Error("Invalid CoinCap response");
+  const p = parseFloat(data.data.priceUsd);
+  if (!p || isNaN(p) || p <= 0) throw new Error("Invalid price from CoinCap");
+  return p;
+}
+
+async function tryCoinGecko(id) {
+  if (!id) throw new Error("Missing coingecko id");
+  const url = "https://api.coingecko.com/api/v3/simple/price";
+  const params = { ids: id, vs_currencies: "usd" };
+  const headers = { "User-Agent": "EscrowBot/1.0" };
+  if (COINGECKO_KEY) headers["x-cg-pro-api-key"] = COINGECKO_KEY;
+  const { data } = await axios.get(url, { params, timeout: 5000, headers });
+  if (!data || !data[id] || typeof data[id].usd !== "number") throw new Error("Invalid CoinGecko response");
+  const p = data[id].usd;
+  if (!p || isNaN(p) || p <= 0) throw new Error("Invalid price from CoinGecko");
+  return p;
+}
+
+async function tryCoinPaprika(id) {
+  if (!id) throw new Error("Missing coinpaprika id");
+  const url = `https://api.coinpaprika.com/v1/tickers/${encodeURIComponent(id)}`;
+  const headers = { "User-Agent": "EscrowBot/1.0" };
+  if (COINPAPRIKA_KEY) headers["X-API-Key"] = COINPAPRIKA_KEY;
+  const { data } = await axios.get(url, { timeout: 5000, headers });
+  if (!data || !data.quotes || !data.quotes.USD || typeof data.quotes.USD.price === "undefined") throw new Error("Invalid CoinPaprika response");
+  const p = parseFloat(data.quotes.USD.price);
+  if (!p || isNaN(p) || p <= 0) throw new Error("Invalid price from CoinPaprika");
+  return p;
+}
+
+// Multi-provider fetch with caching, retries, backoff, and provider fallbacks
+async function fetchPriceWithRetry(symbol, attemptsPerProvider = 2) {
   if (!symbol) throw new Error("Missing symbol");
+  if (!SYMBOLS[symbol]) throw new Error(`Unsupported symbol ${symbol}`);
 
-  // Special-case stablecoin: USDT ~ 1 USD
-  if (symbol === "USDT") {
-    return 1;
-  }
+  // Stablecoin shortcut
+  if (symbol === "USDT") return 1;
 
-  const pair = BINANCE_PAIR[symbol];
-  if (!pair) throw new Error(`Missing Binance pair mapping for ${symbol}`);
-
+  const map = SYMBOLS[symbol];
+  const cacheKey = `price:${symbol}`;
   const now = Date.now();
-  const cached = priceCache[pair];
+  const cached = priceCache[cacheKey];
   if (cached && now - cached.ts < CACHE_TTL) {
-    console.log(`Using cached price for ${pair}: ${cached.price}`);
+    console.log(`Using cached price for ${symbol}: ${cached.price}`);
     return cached.price;
   }
 
-  const url = `https://api.binance.com/api/v3/ticker/price`;
-  const params = { symbol: pair };
-  const headers = { "User-Agent": "EscrowBot/1.0", Accept: "application/json" };
+  // Providers in priority order; each provider will be tried with limited retries
+  const providers = [
+    { name: "binance", fn: () => tryBinance(map.binance) },
+    { name: "coincap", fn: () => tryCoinCap(map.coincap) },
+    { name: "coingecko", fn: () => tryCoinGecko(map.coingecko) },
+    { name: "coinpaprika", fn: () => tryCoinPaprika(map.coinpaprika) },
+  ];
 
-  let lastErr;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      const { data } = await axios.get(url, { params, timeout: 5000, headers });
-      console.log("Binance raw response:", JSON.stringify(data));
-      if (!data || typeof data.price === "undefined") {
-        throw new Error(`Invalid response shape for ${pair}`);
+  let lastErr = null;
+  for (const provider of providers) {
+    for (let attempt = 0; attempt < attemptsPerProvider; attempt++) {
+      try {
+        const p = await provider.fn();
+        if (!p || isNaN(p) || p <= 0) throw new Error(`Invalid price from ${provider.name}`);
+        priceCache[cacheKey] = { price: p, ts: Date.now() };
+        console.log(`Price for ${symbol} from ${provider.name}: ${p}`);
+        return p;
+      } catch (err) {
+        lastErr = err;
+        const status = err.response?.status;
+        const info = err.response?.data || err.message || err;
+        console.error(`${provider.name} attempt ${attempt + 1} failed for ${symbol}:`, status || "", info);
+        if (status === 451 || status === 403) {
+          // blocked/restricted location for this provider: stop trying this provider immediately
+          console.warn(`${provider.name} blocked for ${symbol} (status ${status}), moving to next provider`);
+          break;
+        }
+        if (status === 429) {
+          // rate limited: move to next provider
+          console.warn(`${provider.name} rate limited, moving to next provider`);
+          break;
+        }
+        // exponential backoff between attempts on same provider
+        const backoff = 200 * Math.pow(2, attempt);
+        await new Promise((res) => setTimeout(res, backoff));
       }
-      const price = parseFloat(data.price);
-      if (!price || isNaN(price) || price <= 0) {
-        throw new Error(`Invalid price value from Binance for ${pair}: ${data.price}`);
-      }
-      priceCache[pair] = { price, ts: Date.now() };
-      return price;
-    } catch (err) {
-      lastErr = err;
-      const status = err.response?.status;
-      const msg = err.response?.data || err.message || err;
-      console.error(`Binance attempt ${i + 1} failed for ${pair}:`, status || "", msg);
-      if (status === 429) break;
-      const backoff = 200 * Math.pow(2, i);
-      await new Promise((res) => setTimeout(res, backoff));
     }
   }
-  throw lastErr;
+
+  // If all providers fail, throw the last error so caller can handle it
+  // The wizard will fall back to asking the user for a manual confirmation/price.
+  throw lastErr || new Error("All providers failed");
 }
 
 const createEscrowWizard = new Scenes.WizardScene(
@@ -100,7 +163,7 @@ const createEscrowWizard = new Scenes.WizardScene(
     await ctx.reply(
       `*🔹 Step 2/9*\n\n` +
         `🏷️ Listed Currencies:\n` +
-        `*${Object.keys(BINANCE_PAIR).join(" • ")}*\n\n` +
+        `*${Object.keys(SYMBOLS).join(" • ")}*\n\n` +
         `💰 Enter the coin currency you wish to trade.`,
       { parse_mode: "Markdown" },
     );
@@ -110,11 +173,11 @@ const createEscrowWizard = new Scenes.WizardScene(
   // Step 3/9: USD amount prompt
   async (ctx) => {
     const currency = ctx.message.text.trim().toUpperCase();
-    if (!BINANCE_PAIR[currency]) {
+    if (!SYMBOLS[currency]) {
       return ctx.reply(
         `*❌ Unsupported coin*\n\n` +
           `💱  Please choose one of the supported coins \n` +
-          `💰 Supported: ${Object.keys(BINANCE_PAIR).join(" • ")}\n\n` +
+          `💰 Supported: ${Object.keys(SYMBOLS).join(" • ")}\n\n` +
           `🔁 Please try again.`,
         { parse_mode: "Markdown" },
       );
@@ -129,7 +192,7 @@ const createEscrowWizard = new Scenes.WizardScene(
     return ctx.wizard.next();
   },
 
-  // Step 4/9: Fetch price, compute crypto & ID, summary
+  // Step 4/9: Fetch price, compute crypto & ID, summary (with manual fallback)
   async (ctx) => {
     const usdAmount = parseFloat(ctx.message.text.trim());
     if (isNaN(usdAmount) || usdAmount <= 0) {
@@ -145,15 +208,10 @@ const createEscrowWizard = new Scenes.WizardScene(
     e.usdAmount = usdAmount;
 
     try {
-      const price = await fetchPriceWithRetry(e.currency, 3);
+      const price = await fetchPriceWithRetry(e.currency, 2);
       if (!price || typeof price !== "number" || price <= 0) {
-        console.error("Invalid price returned:", price);
-        return ctx.reply(
-          `*❌ Failed to fetch price*\n\n` + `⏳ Please try again later`,
-          { parse_mode: "Markdown" },
-        );
+        throw new Error("Invalid price returned");
       }
-
       e.cryptoAmount = (usdAmount / price).toFixed(8);
       e.id = Date.now().toString().slice(-6);
 
@@ -172,12 +230,70 @@ const createEscrowWizard = new Scenes.WizardScene(
       );
       return ctx.wizard.next();
     } catch (err) {
-      console.error("Price fetch error final:", err.response?.status, err.response?.data || err.message || err);
-      return ctx.reply(
-        `*❌ Failed to fetch price*\n\n` + `⏳ Please try again later`,
+      console.error("Price fetch final error:", err.response?.status, err.response?.data || err.message || err);
+
+      // Fallback: ask user to confirm or provide a manual crypto amount
+      await ctx.reply(
+        `*⚠️ Price lookup unavailable*\n\n` +
+          `I couldn't fetch live market prices from external providers due to network or location restrictions.\n\n` +
+          `Please either:\n` +
+          `1. Paste the current *price USD per ${e.currency}* (e.g. 43000) \n` +
+          `or\n` +
+          `2. Paste the *crypto amount* you will deposit (e.g. 0.00543210)\n\n` +
+          `Reply with a number for price or crypto amount.`,
         { parse_mode: "Markdown" },
       );
+
+      // set flag to handle manual fallback in next step
+      ctx.wizard.state.awaitingManualPrice = true;
+      return ctx.wizard.next();
     }
+  },
+
+  // Step 4b/5: Handle manual price or crypto amount then ask for deposit address
+  async (ctx) => {
+    const e = ctx.wizard.state.escrow;
+    if (ctx.wizard.state.awaitingManualPrice) {
+      const input = ctx.message.text.trim();
+      const asNumber = parseFloat(input);
+      if (isNaN(asNumber) || asNumber <= 0) {
+        return ctx.reply(
+          `*❌ Invalid number*\n\n` + `Please paste a valid positive number for price or crypto amount.`,
+          { parse_mode: "Markdown" },
+        );
+      }
+
+      // Heuristic: if value > 10 it's probably a USD price per coin; else treat as crypto amount
+      if (asNumber > 10) {
+        // user provided USD price per coin
+        const pricePerCoin = asNumber;
+        e.cryptoAmount = (e.usdAmount / pricePerCoin).toFixed(8);
+        await ctx.reply(
+          `*ℹ️ Manual price used*\n\n` +
+            `Price: $${pricePerCoin} per ${e.currency}\n` +
+            `Computed crypto amount: ${e.cryptoAmount} ${e.currency}`,
+          { parse_mode: "Markdown" },
+        );
+      } else {
+        // user provided crypto amount directly
+        e.cryptoAmount = asNumber.toFixed(8);
+        await ctx.reply(
+          `*ℹ️ Manual crypto amount used*\n\n` +
+            `Using provided crypto amount: ${e.cryptoAmount} ${e.currency}`,
+          { parse_mode: "Markdown" },
+        );
+      }
+
+      e.id = Date.now().toString().slice(-6);
+      // clear manual flag
+      ctx.wizard.state.awaitingManualPrice = false;
+    }
+
+    await ctx.reply(
+      `🔹 Next step\n\n` + `🏦  Enter the seller’s *on‑chain Deposit address*.`,
+      { parse_mode: "Markdown" },
+    );
+    return ctx.wizard.next();
   },
 
   // Step 5/9: Seller’s deposit address
