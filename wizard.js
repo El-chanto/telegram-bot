@@ -16,6 +16,50 @@ const CG_ID = {
   DOGE: "dogecoin",
 };
 
+// Simple in-memory short cache to reduce CoinGecko calls
+const priceCache = {}; // { coinId: { price: number, ts: epoch_ms } }
+const CACHE_TTL = 30 * 1000; // 30 seconds
+
+async function fetchPriceWithRetry(coinId, attempts = 3) {
+  if (!coinId) throw new Error("Missing coinId");
+
+  const now = Date.now();
+  const cached = priceCache[coinId];
+  if (cached && now - cached.ts < CACHE_TTL) {
+    console.log(`Using cached price for ${coinId}: ${cached.price}`);
+    return cached.price;
+  }
+
+  const url = "https://api.coingecko.com/api/v3/simple/price";
+  const params = { ids: coinId, vs_currencies: "usd" };
+  const headers = { "User-Agent": "EscrowBot/1.0" };
+
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const { data } = await axios.get(url, { params, timeout: 5000, headers });
+      console.log("CoinGecko raw response:", JSON.stringify(data));
+      if (!data || !data[coinId] || typeof data[coinId].usd !== "number") {
+        throw new Error(`Invalid response shape for ${coinId}`);
+      }
+      const price = data[coinId].usd;
+      priceCache[coinId] = { price, ts: Date.now() };
+      return price;
+    } catch (err) {
+      lastErr = err;
+      const status = err.response?.status;
+      const msg = err.response?.data || err.message || err;
+      console.error(`CoinGecko attempt ${i + 1} failed for ${coinId}:`, status || "", msg);
+      // If rate limited, break and return lastErr quickly so caller can decide
+      if (status === 429) break;
+      // exponential backoff before retrying
+      const backoff = 200 * Math.pow(2, i);
+      await new Promise((res) => setTimeout(res, backoff));
+    }
+  }
+  throw lastErr;
+}
+
 const createEscrowWizard = new Scenes.WizardScene(
   "create-escrow",
 
@@ -91,17 +135,25 @@ const createEscrowWizard = new Scenes.WizardScene(
     const e = ctx.wizard.state.escrow;
     e.usdAmount = usdAmount;
 
-    try {
-      const { data } = await axios.get(
-        "https://api.coingecko.com/api/v3/simple/price",
-        {
-          params: {
-            ids: CG_ID[e.currency],
-            vs_currencies: "usd",
-          },
-        },
+    const coinId = CG_ID[e.currency];
+    if (!coinId) {
+      console.error("Missing coinId mapping for currency:", e.currency);
+      return ctx.reply(
+        `*❌ Failed to fetch price*\n\n` + `⏳ Please try again later`,
+        { parse_mode: "Markdown" },
       );
-      const price = data[CG_ID[e.currency]].usd;
+    }
+
+    try {
+      const price = await fetchPriceWithRetry(coinId, 3);
+      if (!price || typeof price !== "number" || price <= 0) {
+        console.error("Invalid price returned:", price);
+        return ctx.reply(
+          `*❌ Failed to fetch price*\n\n` + `⏳ Please try again later`,
+          { parse_mode: "Markdown" },
+        );
+      }
+
       e.cryptoAmount = (usdAmount / price).toFixed(8);
       e.id = Date.now().toString().slice(-6);
 
@@ -120,7 +172,7 @@ const createEscrowWizard = new Scenes.WizardScene(
       );
       return ctx.wizard.next();
     } catch (err) {
-      console.error(err);
+      console.error("Coingecko fetch error final:", err.response?.status, err.response?.data || err.message || err);
       return ctx.reply(
         `*❌ Failed to fetch price*\n\n` + `⏳ Please try again later`,
         { parse_mode: "Markdown" },
