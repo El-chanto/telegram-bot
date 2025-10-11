@@ -3,25 +3,28 @@ const { Scenes } = require("telegraf");
 const axios = require("axios");
 const { depositAddresses, addressValidators } = require("./config");
 
-// CoinGecko lookup map
-const CG_ID = {
+// CoinCap lookup map
+const CC_ID = {
   BTC: "bitcoin",
   ETH: "ethereum",
   USDT: "tether",
   TRX: "tron",
   LTC: "litecoin",
   XRP: "ripple",
-  TON: "the-open-network",
+  TON: "ton", // confirm if CoinCap uses "ton" or "toncoin" and adjust if needed
   SOL: "solana",
   DOGE: "dogecoin",
 };
 
-// Simple in-memory short cache to reduce CoinGecko calls
-const priceCache = {}; // { coinId: { price: number, ts: epoch_ms } }
+// Simple in-memory short cache to reduce API calls
+const priceCache = {}; // { coinIdOrSymbol: { price: number, ts: epoch_ms } }
 const CACHE_TTL = 30 * 1000; // 30 seconds
 
-async function fetchPriceWithRetry(coinId, attempts = 3) {
-  if (!coinId) throw new Error("Missing coinId");
+async function fetchPriceWithRetry(coinSymbol, attempts = 3) {
+  if (!coinSymbol) throw new Error("Missing coinSymbol");
+
+  const coinId = CC_ID[coinSymbol];
+  if (!coinId) throw new Error(`Missing CoinCap id mapping for ${coinSymbol}`);
 
   const now = Date.now();
   const cached = priceCache[coinId];
@@ -30,26 +33,28 @@ async function fetchPriceWithRetry(coinId, attempts = 3) {
     return cached.price;
   }
 
-  const url = "https://api.coingecko.com/api/v3/simple/price";
-  const params = { ids: coinId, vs_currencies: "usd" };
-  const headers = { "User-Agent": "EscrowBot/1.0" };
+  const url = `https://api.coincap.io/v2/assets/${encodeURIComponent(coinId)}`;
+  const headers = { "User-Agent": "EscrowBot/1.0", Accept: "application/json" };
 
   let lastErr;
   for (let i = 0; i < attempts; i++) {
     try {
-      const { data } = await axios.get(url, { params, timeout: 5000, headers });
-      console.log("CoinGecko raw response:", JSON.stringify(data));
-      if (!data || !data[coinId] || typeof data[coinId].usd !== "number") {
+      const { data } = await axios.get(url, { timeout: 5000, headers });
+      console.log("CoinCap raw response:", JSON.stringify(data));
+      if (!data || !data.data || typeof data.data.priceUsd === "undefined") {
         throw new Error(`Invalid response shape for ${coinId}`);
       }
-      const price = data[coinId].usd;
+      const price = parseFloat(data.data.priceUsd);
+      if (!price || typeof price !== "number" || isNaN(price) || price <= 0) {
+        throw new Error(`Invalid price value from CoinCap for ${coinId}: ${data.data.priceUsd}`);
+      }
       priceCache[coinId] = { price, ts: Date.now() };
       return price;
     } catch (err) {
       lastErr = err;
       const status = err.response?.status;
       const msg = err.response?.data || err.message || err;
-      console.error(`CoinGecko attempt ${i + 1} failed for ${coinId}:`, status || "", msg);
+      console.error(`CoinCap attempt ${i + 1} failed for ${coinId}:`, status || "", msg);
       // If rate limited, break and return lastErr quickly so caller can decide
       if (status === 429) break;
       // exponential backoff before retrying
@@ -91,7 +96,7 @@ const createEscrowWizard = new Scenes.WizardScene(
     await ctx.reply(
       `*🔹 Step 2/9*\n\n` +
         `🏷️ Listed Currencies:\n` +
-        `*${Object.keys(CG_ID).join(" • ")}*\n\n` +
+        `*${Object.keys(CC_ID).join(" • ")}*\n\n` +
         `💰 Enter the coin currency you wish to trade.`,
       { parse_mode: "Markdown" },
     );
@@ -101,11 +106,11 @@ const createEscrowWizard = new Scenes.WizardScene(
   // Step 3/9: USD amount prompt
   async (ctx) => {
     const currency = ctx.message.text.trim().toUpperCase();
-    if (!CG_ID[currency]) {
+    if (!CC_ID[currency]) {
       return ctx.reply(
-        `*❌ Unsupported coin\n\n*` +
+        `*❌ Unsupported coin*\n\n` +
           `💱  Please choose one of the supported coins \n` +
-          `💰 Supported: ${Object.keys(CG_ID).join(" • ")}\n\n` +
+          `💰 Supported: ${Object.keys(CC_ID).join(" • ")}\n\n` +
           `🔁 Please try again.`,
         { parse_mode: "Markdown" },
       );
@@ -135,17 +140,8 @@ const createEscrowWizard = new Scenes.WizardScene(
     const e = ctx.wizard.state.escrow;
     e.usdAmount = usdAmount;
 
-    const coinId = CG_ID[e.currency];
-    if (!coinId) {
-      console.error("Missing coinId mapping for currency:", e.currency);
-      return ctx.reply(
-        `*❌ Failed to fetch price*\n\n` + `⏳ Please try again later`,
-        { parse_mode: "Markdown" },
-      );
-    }
-
     try {
-      const price = await fetchPriceWithRetry(coinId, 3);
+      const price = await fetchPriceWithRetry(e.currency, 3);
       if (!price || typeof price !== "number" || price <= 0) {
         console.error("Invalid price returned:", price);
         return ctx.reply(
@@ -172,7 +168,7 @@ const createEscrowWizard = new Scenes.WizardScene(
       );
       return ctx.wizard.next();
     } catch (err) {
-      console.error("Coingecko fetch error final:", err.response?.status, err.response?.data || err.message || err);
+      console.error("Price fetch error final:", err.response?.status, err.response?.data || err.message || err);
       return ctx.reply(
         `*❌ Failed to fetch price*\n\n` + `⏳ Please try again later`,
         { parse_mode: "Markdown" },
