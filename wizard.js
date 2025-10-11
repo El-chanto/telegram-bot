@@ -15,6 +15,19 @@ const CC_ID = {
   DOGE: "dogecoin",
 };
 
+// Optional fallback: CoinGecko ids (used only if COINCAP fails)
+const CG_ID = {
+  bitcoin: "bitcoin",
+  ethereum: "ethereum",
+  tether: "tether",
+  tron: "tron",
+  litecoin: "litecoin",
+  ripple: "ripple",
+  toncoin: "toncoin",
+  solana: "solana",
+  dogecoin: "dogecoin",
+};
+
 // helper: get text safely from different update types
 function getText(ctx) {
   if (ctx.message && ctx.message.text) return ctx.message.text;
@@ -31,6 +44,26 @@ function escrowKey(ctx) {
 // simple in-memory cache and retry helper for CoinCap
 const priceCache = {}; // { key: { price, expiresAt } }
 
+function sleep(ms) {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
+function jitteredBackoff(baseMs, attempt) {
+  const jitter = Math.floor(Math.random() * baseMs);
+  return baseMs * Math.pow(2, attempt) + jitter;
+}
+
+/**
+ * fetchPriceWithCache
+ *  - primary: CoinCap single-asset endpoint
+ *  - fallback: CoinGecko simple price endpoint (enabled when fallback param true)
+ *  - robust retries, backoff with jitter, special handling for DNS ENOTFOUND
+ *
+ * opts:
+ *  - ttlMs: cache TTL (ms)
+ *  - retries: number of retry attempts (default 3)
+ *  - fallback: boolean to enable fallback provider (default true)
+ */
 async function fetchPriceWithCache(id, opts = {}) {
   const key = id;
   const now = Date.now();
@@ -39,43 +72,99 @@ async function fetchPriceWithCache(id, opts = {}) {
   const cached = priceCache[key];
   if (cached && cached.expiresAt > now) return cached.price;
 
-  const maxRetries = opts.retries || 2;
+  const maxRetries = typeof opts.retries === "number" ? opts.retries : 3;
+  const useFallback = typeof opts.fallback === "boolean" ? opts.fallback : true;
+
   let attempt = 0;
-  let lastErr;
+  let lastErr = null;
+
+  const axiosBaseConfig = {
+    timeout: 7000,
+    headers: { "User-Agent": "BitSafeEscrowBot/1.0 (+https://telegram-bot-zqku.onrender.com)" },
+    validateStatus: (s) => s < 500 || s === 429,
+  };
+
+  // Try primary provider (CoinCap)
   while (attempt <= maxRetries) {
     try {
-      // CoinCap single-asset endpoint
       const url = `https://api.coincap.io/v2/assets/${encodeURIComponent(id)}`;
-      const resp = await axios.get(url, {
-        timeout: 5000,
-        headers: { "User-Agent": "BitSafeEscrowBot/1.0 (+https://telegram-bot-zqku.onrender.com)" },
-        validateStatus: (s) => s < 500 || s === 429,
-      });
+      const resp = await axios.get(url, axiosBaseConfig);
 
       if (resp.status === 429) {
-        lastErr = new Error("Rate limited by CoinCap");
-        lastErr.status = 429;
-        throw lastErr;
+        const err = new Error("Rate limited by CoinCap");
+        err.status = 429;
+        throw err;
       }
 
       const raw = resp.data && resp.data.data;
       const price = raw && raw.priceUsd ? parseFloat(raw.priceUsd) : NaN;
       if (!price || Number.isNaN(price) || price <= 0) {
-        lastErr = new Error("Invalid price returned from CoinCap");
-        throw lastErr;
+        const err = new Error("Invalid price returned from CoinCap");
+        err.status = resp.status;
+        throw err;
       }
 
       priceCache[key] = { price, expiresAt: Date.now() + ttl };
       return price;
     } catch (err) {
       lastErr = err;
+      // Immediate special handling for DNS unresolved errors: don't aggressively retry many times
+      if (err && (err.code === "ENOTFOUND" || err.code === "EAI_AGAIN")) {
+        // attempt a couple of quick retries with small jitter then break to fallback
+        attempt += 1;
+        if (attempt > 2) break;
+        const backoffMs = jitteredBackoff(300, attempt);
+        await sleep(backoffMs);
+        continue;
+      }
+
       attempt += 1;
       if (attempt > maxRetries) break;
-      const backoffMs = err && err.status === 429 ? 1500 * attempt : 200 * Math.pow(2, attempt);
-      await new Promise((res) => setTimeout(res, backoffMs));
+
+      // If rate-limited, apply smaller deterministic backoff; otherwise exponential jitter
+      const backoffMs = err && err.status === 429 ? 1500 * attempt : jitteredBackoff(200, attempt);
+      await sleep(backoffMs);
     }
   }
-  throw lastErr;
+
+  // If enabled, try fallback provider (CoinGecko)
+  if (useFallback) {
+    try {
+      // Map CoinCap id to CoinGecko id if possible
+      const cgId = CG_ID[id] || id;
+      // CoinGecko simple price endpoint returns prices in USD
+      const url = `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(
+        cgId,
+      )}&vs_currencies=usd`;
+      const resp = await axios.get(url, axiosBaseConfig);
+
+      if (resp.status >= 400) {
+        const err = new Error("CoinGecko returned error");
+        err.status = resp.status;
+        throw err;
+      }
+
+      const price = resp.data && resp.data[cgId] && resp.data[cgId].usd
+        ? parseFloat(resp.data[cgId].usd)
+        : NaN;
+
+      if (!price || Number.isNaN(price) || price <= 0) {
+        const err = new Error("Invalid price returned from CoinGecko");
+        throw err;
+      }
+
+      priceCache[key] = { price, expiresAt: Date.now() + ttl };
+      return price;
+    } catch (err) {
+      lastErr = err;
+      // augment with a tag to indicate fallback also failed
+      lastErr.fallbackFailed = true;
+    }
+  }
+
+  // Throw best error available with useful properties for logging/handling
+  const finalErr = lastErr instanceof Error ? lastErr : new Error("Failed to fetch price");
+  throw finalErr;
 }
 
 const createEscrowWizard = new Scenes.WizardScene(
@@ -154,7 +243,9 @@ const createEscrowWizard = new Scenes.WizardScene(
     e.usdAmount = usdAmount;
 
     try {
-      const price = await fetchPriceWithCache(CC_ID[e.currency], { ttlMs: 30000, retries: 2 });
+      // Use CoinCap asset id map
+      const assetId = CC_ID[e.currency];
+      const price = await fetchPriceWithCache(assetId, { ttlMs: 30000, retries: 3, fallback: true });
       e.cryptoAmount = (usdAmount / price).toFixed(8);
       e.id = Date.now().toString().slice(-6);
 
@@ -173,9 +264,32 @@ const createEscrowWizard = new Scenes.WizardScene(
       );
       return ctx.wizard.next();
     } catch (err) {
-      console.error("CoinCap fetch failed:", { message: err && err.message, status: err && err.status });
+      // Log detailed error for operators
+      console.error("Price fetch failed:", {
+        message: err && err.message,
+        code: err && err.code,
+        status: err && err.status,
+        fallbackFailed: err && err.fallbackFailed,
+      });
+
+      // Surface a concise user-facing message
+      // Distinguish DNS/network problems vs provider errors
+      if (err && (err.code === "ENOTFOUND" || err.code === "EAI_AGAIN")) {
+        return ctx.reply(
+          `*❌ Network error*\n\n` +
+            `⛔ Unable to reach the price provider right now. Please check your network or try again in a few minutes.`,
+          { parse_mode: "Markdown" },
+        );
+      }
+      if (err && err.status === 429) {
+        return ctx.reply(
+          `*❌ Rate limited*\n\n` + `⏳ The price service is busy. Please wait and try again shortly.`,
+          { parse_mode: "Markdown" },
+        );
+      }
+
       return ctx.reply(
-        `*❌ Failed to fetch price*\n\n` + `⏳ Please try again later`,
+        `*❌ Failed to fetch price*\n\n` + `⏳ Please try again later.`,
         { parse_mode: "Markdown" },
       );
     }
