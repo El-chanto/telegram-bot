@@ -2,17 +2,17 @@ const { Scenes } = require("telegraf");
 const axios = require("axios");
 const { depositAddresses, addressValidators } = require("./config");
 
-// CoinCap lookup map (asset ids used by CoinCap)
-const CC_ID = {
-  BTC: "bitcoin",
-  ETH: "ethereum",
-  USDT: "tether",
-  TRX: "tron",
-  LTC: "litecoin",
-  XRP: "ripple",
-  TON: "toncoin",
-  SOL: "solana",
-  DOGE: "dogecoin",
+// Lookup map (kept for user-facing symbols)
+const ASSET_MAP = {
+  BTC: { coincap: "bitcoin", coingecko: "bitcoin", binance: "BTCUSDT" },
+  ETH: { coincap: "ethereum", coingecko: "ethereum", binance: "ETHUSDT" },
+  USDT: { coincap: "tether", coingecko: "tether", binance: "USDTUSDT" },
+  TRX: { coincap: "tron", coingecko: "tron", binance: "TRXUSDT" },
+  LTC: { coincap: "litecoin", coingecko: "litecoin", binance: "LTCUSDT" },
+  XRP: { coincap: "ripple", coingecko: "ripple", binance: "XRPUSDT" },
+  TON: { coincap: "toncoin", coingecko: "the-open-network", binance: "TONUSDT" },
+  SOL: { coincap: "solana", coingecko: "solana", binance: "SOLUSDT" },
+  DOGE: { coincap: "dogecoin", coingecko: "dogecoin", binance: "DOGEUSDT" },
 };
 
 // helper: get text safely from different update types
@@ -28,54 +28,117 @@ function escrowKey(ctx) {
   return String((ctx.chat && ctx.chat.id) || (ctx.from && ctx.from.id) || "unknown");
 }
 
-// simple in-memory cache and retry helper for CoinCap
+// simple in-memory cache and retry helper
 const priceCache = {}; // { key: { price, expiresAt } }
 
-async function fetchPriceWithCache(id, opts = {}) {
-  const key = id;
+// provider implementations
+async function fetchCoinCapPrice(id) {
+  const url = `https://api.coincap.io/v2/assets/${encodeURIComponent(id)}`;
+  const resp = await axios.get(url, {
+    timeout: 5000,
+    headers: { "User-Agent": "BitSafeEscrowBot/1.0 (+https://yourdomain.example)" },
+    validateStatus: (s) => s < 500 || s === 429,
+  });
+  if (resp.status === 429) {
+    const err = new Error("Rate limited by CoinCap");
+    err.status = 429;
+    throw err;
+  }
+  const raw = resp.data && resp.data.data;
+  const price = raw && raw.priceUsd ? parseFloat(raw.priceUsd) : NaN;
+  if (!price || Number.isNaN(price) || price <= 0) throw new Error("Invalid price from CoinCap");
+  return price;
+}
+
+async function fetchCoinGeckoPrice(id) {
+  const url = `https://api.coingecko.com/api/v3/simple/price`;
+  const resp = await axios.get(url, {
+    params: { ids: id, vs_currencies: "usd" },
+    timeout: 5000,
+    headers: { "User-Agent": "BitSafeEscrowBot/1.0 (+https://yourdomain.example)" },
+    validateStatus: (s) => s < 500 || s === 429,
+  });
+  if (resp.status === 429) {
+    const err = new Error("Rate limited by CoinGecko");
+    err.status = 429;
+    throw err;
+  }
+  const price = resp.data && resp.data[id] && resp.data[id].usd;
+  if (!price || typeof price !== "number" || price <= 0) throw new Error("Invalid price from CoinGecko");
+  return price;
+}
+
+async function fetchBinancePrice(symbol) {
+  // Binance gives price as string; using USDT pair as USD approximation
+  const url = `https://api.binance.com/api/v3/ticker/price`;
+  const resp = await axios.get(url, {
+    params: { symbol },
+    timeout: 5000,
+    headers: { "User-Agent": "BitSafeEscrowBot/1.0 (+https://yourdomain.example)" },
+    validateStatus: (s) => s < 500 || s === 429,
+  });
+  if (resp.status === 429) {
+    const err = new Error("Rate limited by Binance");
+    err.status = 429;
+    throw err;
+  }
+  const price = resp.data && resp.data.price ? parseFloat(resp.data.price) : NaN;
+  if (!price || Number.isNaN(price) || price <= 0) throw new Error("Invalid price from Binance");
+  return price;
+}
+
+// unified fetch with cache, retries, backoff, and provider fallback
+async function fetchPriceWithCache(assetKey, opts = {}) {
+  if (!ASSET_MAP[assetKey]) throw new Error("Unsupported asset");
+  const idKey = assetKey;
   const now = Date.now();
   const ttl = opts.ttlMs || 30000; // default 30s cache
 
-  const cached = priceCache[key];
+  const cached = priceCache[idKey];
   if (cached && cached.expiresAt > now) return cached.price;
 
   const maxRetries = opts.retries || 2;
   let attempt = 0;
-  let lastErr;
+  let lastErr = null;
+
+  // provider order: CoinCap -> CoinGecko -> Binance
+  const providers = [
+    async () => fetchCoinCapPrice(ASSET_MAP[assetKey].coincap),
+    async () => fetchCoinGeckoPrice(ASSET_MAP[assetKey].coingecko),
+    async () => fetchBinancePrice(ASSET_MAP[assetKey].binance),
+  ];
+
   while (attempt <= maxRetries) {
-    try {
-      // CoinCap single-asset endpoint
-      const url = `https://api.coincap.io/v2/assets/${encodeURIComponent(id)}`;
-      const resp = await axios.get(url, {
-        timeout: 5000,
-        headers: { "User-Agent": "BitSafeEscrowBot/1.0 (+https://yourdomain.example)" },
-        validateStatus: (s) => s < 500 || s === 429,
-      });
-
-      if (resp.status === 429) {
-        lastErr = new Error("Rate limited by CoinCap");
-        lastErr.status = 429;
-        throw lastErr;
+    for (let i = 0; i < providers.length; i++) {
+      try {
+        const price = await providers[i]();
+        priceCache[idKey] = { price, expiresAt: Date.now() + ttl };
+        return price;
+      } catch (err) {
+        // if DNS/network lookup error or host not found, try next provider immediately
+        const code = err && err.code;
+        if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
+          lastErr = err;
+          // continue to next provider without backoff
+          continue;
+        }
+        // if rate limited, set status for backoff decision
+        lastErr = err;
+        // if last provider in list, we'll perform backoff and retry provider sequence
+        if (i === providers.length - 1) break;
+        // otherwise try next provider right away
       }
-
-      const raw = resp.data && resp.data.data;
-      const price = raw && raw.priceUsd ? parseFloat(raw.priceUsd) : NaN;
-      if (!price || Number.isNaN(price) || price <= 0) {
-        lastErr = new Error("Invalid price returned from CoinCap");
-        throw lastErr;
-      }
-
-      priceCache[key] = { price, expiresAt: Date.now() + ttl };
-      return price;
-    } catch (err) {
-      lastErr = err;
-      attempt += 1;
-      if (attempt > maxRetries) break;
-      const backoffMs = err && err.status === 429 ? 1500 * attempt : 200 * Math.pow(2, attempt);
-      await new Promise((res) => setTimeout(res, backoffMs));
     }
+
+    attempt += 1;
+    if (attempt > maxRetries) break;
+
+    // exponential/backoff: if lastErr shows 429 use linear backoff; else exponential
+    const backoffMs = lastErr && lastErr.status === 429 ? 1500 * attempt : 200 * Math.pow(2, attempt);
+    await new Promise((r) => setTimeout(r, backoffMs));
   }
-  throw lastErr;
+
+  throw lastErr || new Error("Failed to fetch price from providers");
 }
 
 const createEscrowWizard = new Scenes.WizardScene(
@@ -109,7 +172,7 @@ const createEscrowWizard = new Scenes.WizardScene(
     await ctx.reply(
       `*🔹 Step 2/9*\n\n` +
         `🏷️ Listed Currencies:\n` +
-        `*${Object.keys(CC_ID).join(" • ")}*\n\n` +
+        `*${Object.keys(ASSET_MAP).join(" • ")}*\n\n` +
         `💰 Enter the coin currency you wish to trade.`,
       { parse_mode: "Markdown" },
     );
@@ -119,11 +182,11 @@ const createEscrowWizard = new Scenes.WizardScene(
   // Step 3/9: USD amount prompt
   async (ctx) => {
     const currency = getText(ctx).trim().toUpperCase();
-    if (!CC_ID[currency]) {
+    if (!ASSET_MAP[currency]) {
       return ctx.reply(
         `*❌ Unsupported coin*\n\n` +
           `💱  Please choose one of the supported coins \n` +
-          `💰 Supported: ${Object.keys(CC_ID).join(" • ")}\n\n` +
+          `💰 Supported: ${Object.keys(ASSET_MAP).join(" • ")}\n\n` +
           `🔁 Please try again.`,
         { parse_mode: "Markdown" },
       );
@@ -154,7 +217,7 @@ const createEscrowWizard = new Scenes.WizardScene(
     e.usdAmount = usdAmount;
 
     try {
-      const price = await fetchPriceWithCache(CC_ID[e.currency], { ttlMs: 30000, retries: 2 });
+      const price = await fetchPriceWithCache(e.currency, { ttlMs: 30000, retries: 2 });
       e.cryptoAmount = (usdAmount / price).toFixed(8);
       e.id = Date.now().toString().slice(-6);
 
@@ -173,7 +236,7 @@ const createEscrowWizard = new Scenes.WizardScene(
       );
       return ctx.wizard.next();
     } catch (err) {
-      console.error("CoinCap fetch failed:", { message: err && err.message, status: err && err.status });
+      console.error("Price fetch failed:", { message: err && err.message, code: err && err.code, status: err && err.status });
       return ctx.reply(
         `*❌ Failed to fetch price*\n\n` + `⏳ Please try again later`,
         { parse_mode: "Markdown" },
@@ -277,7 +340,6 @@ const createEscrowWizard = new Scenes.WizardScene(
 
 // scene-level cancel handler
 createEscrowWizard.command("cancel", async (ctx) => {
-  // remove any persisted escrow for this chat
   if (ctx.session && ctx.session.escrows) {
     delete ctx.session.escrows[escrowKey(ctx)];
   }
