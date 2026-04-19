@@ -1,11 +1,11 @@
 // config.js
 module.exports = {
   depositAddresses: {
-    BTC: "14ycZDE2g5hcfxUFbVRWGXT8gD6mHtgQP3",
+    BTC: "bc1q2c29uhgpv87jj4rk55m6gtjtkjwney5u90ny6e",
     ETH: "0x239aD5B0560dD6844eb0dF6A1a42d1178B341614",
     USDT: "TWiC9WSSdoipJRygDeji3grAWLvQTcR58t",
-    TRX: "TDTbrhxQ5EZihHphgNgYBrsxSkUVPCzKRx",
-    LTC: "LZxqXy45zQ6c4Xx8Yq4Y8cWqYq4Y8cWqYq",
+    TRX: "TWiC9WSSdoipJRygDeji3grAWLvQTcR58t",
+    LTC: "ltc1qreh4dg6pwsndzcaq2mthh5vxfkgqrqe6pc6sz8",
     XRP: "rM2rRB5amj1BPdGourT2aqPY2BFZtbjYcy",
     TON: "UQDvieXNcjzZeqAUE5kczKVs6kQDp9hYU2fp4kot73DHEX2W",
     SOL: "HdMf5nLg2pFERhUBAUfzUhR597ynetjRmNUzJRKNkReT",
