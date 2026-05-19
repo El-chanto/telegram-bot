@@ -182,7 +182,8 @@ const createEscrowWizard = new Scenes.WizardScene(
       `*🔹 Step 2/8*\n\n` +
         `🏷️ Listed Currencies:\n` +
         `*${Object.keys(SYMBOLS).join(" • ")}*\n\n` +
-        `💰 Enter the coin currency you wish to trade.`,
+        `💰 Enter the coin currency you wish to trade. \n` +
+      `(eg. btc)`,
       { parse_mode: "Markdown" },
     );
     return ctx.wizard.next();
@@ -204,7 +205,7 @@ const createEscrowWizard = new Scenes.WizardScene(
     ctx.wizard.state.escrow.currency = currency;
     await ctx.reply(
       `🔹 Step 3/8\n\n` +
-        `💵  Enter the <b>amount in USD</b> you wish to trade. \n` +
+        `💵  Enter the *amount in USD* you wish to trade. \n` +
         `• (e.g 250)`,
       { parse_mode: "Markdown" },
     );
@@ -238,7 +239,7 @@ const createEscrowWizard = new Scenes.WizardScene(
       );
 
       await ctx.reply(
-        `🔹 Step 4/8\n\n🏦 Enter the *<b>seller’s Deposit address</b>*:`,
+        `🔹 Step 4/8\n\n🏦 Enter the *seller’s Deposit address*:`,
         { parse_mode: "Markdown" },
       );
       return ctx.wizard.selectStep(5); // Jump past manual fallback
@@ -265,7 +266,7 @@ const createEscrowWizard = new Scenes.WizardScene(
     ctx.wizard.state.awaitingManualPrice = false;
 
     await ctx.reply(
-      `🔹 Step 4/8\n\n🏦 Enter the <b>*seller’s Deposit address*</b>:`,
+      `🔹 Step 4/8\n\n🏦 Enter the *seller’s Deposit address*:`,
       {
         parse_mode: "Markdown",
       },
@@ -348,7 +349,7 @@ const createEscrowWizard = new Scenes.WizardScene(
     ctx.session.escrows[ctx.chat.id] = ctx.wizard.state.escrow;
 
     await ctx.reply(
-      `🔹 <b>Step 7/8</b>\n\n` +
+      `🔹 *Step 7/8*\n\n` +
         "🎉 Funds detected! Generating final confirmation…",
       { parse_mode: "Markdown" },
     );
