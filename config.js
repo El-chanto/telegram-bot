@@ -3,7 +3,8 @@ module.exports = {
   depositAddresses: {
     BTC: "bc1q2c29uhgpv87jj4rk55m6gtjtkjwney5u90ny6e",
     ETH: "0x239aD5B0560dD6844eb0dF6A1a42d1178B341614",
-    USDT: "TWiC9WSSdoipJRygDeji3grAWLvQTcR58t",
+    USDT_TRC20: "TWiC9WSSdoipJRygDeji3grAWLvQTcR58t",
+    USDT_EC20: "0x239aD5B0560dD6844eb0dF6A1a42d1178B341614",
     TRX: "TWiC9WSSdoipJRygDeji3grAWLvQTcR58t",
     LTC: "ltc1qreh4dg6pwsndzcaq2mthh5vxfkgqrqe6pc6sz8",
     XRP: "rM2rRB5amj1BPdGourT2aqPY2BFZtbjYcy",
@@ -21,11 +22,11 @@ module.exports = {
     // Ethereum mainnet (~0x + 40 hex)
     ETH: (addr) => /^0x[a-fA-F0-9]{40}$/.test(addr),
 
-    /* // USDT on TRON (TRC-20) 
-    // Starts with 'T', followed by 33 alphanumeric characters (excluding 0, O, I, l)
-    USDT_TRC20: (addr) => /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(addr), */
     // USDT on Ethereum (ERC-20) same format as ETH
-    USDT: (addr) => /^0x[a-fA-F0-9]{40}$/.test(addr),
+    USDT_ERC20: (addr) => /^0x[a-fA-F0-9]{40}$/.test(addr),
+
+    // USDT on Tether (TRC-20)
+    USDT_TRC20: (addr) => /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(addr),
 
     // Tron mainnet (base58, starts with T, 34 chars)
     TRX: (addr) => /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(addr),
