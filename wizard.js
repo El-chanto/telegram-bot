@@ -134,10 +134,12 @@ async function fetchPriceWithRetry(symbol, attemptsPerProvider = 2) {
   throw lastErr || new Error("All providers failed");
 }
 
+// ... [Keep all imports, SYMBOLS, and fetch functions exactly as they are] ...
+
 const createEscrowWizard = new Scenes.WizardScene(
   "create-escrow",
 
-  // Step 1/9: Seller’s Telegram handle
+  // Step 1: Seller Handle
   async (ctx) => {
     await ctx.reply(
       `*🔹 Step 1/9*\n\n` +
@@ -148,20 +150,13 @@ const createEscrowWizard = new Scenes.WizardScene(
     return ctx.wizard.next();
   },
 
-  // Step 2/9: Coin symbol
+  // Step 2: Coin Symbol
   async (ctx) => {
     const handle = ctx.message.text.trim();
     if (!/^@[A-Za-z0-9_]{5,32}$/.test(handle)) {
-      return ctx.reply(
-        `*❌ Invalid Handle*\n\n` +
-          `🚫 Handle must start with @\n` +
-          `🔤 Only letters, numbers, or underscores allowed\n\n` +
-          `🔁 Please try again.`,
-        { parse_mode: "Markdown" },
-      );
+      return ctx.reply(`*❌ Invalid Handle*`, { parse_mode: "Markdown" });
     }
     ctx.wizard.state.escrow = { sellerHandle: handle };
-
     await ctx.reply(
       `*🔹 Step 2/9*\n\n` +
         `🏷️ Listed Currencies:\n` +
@@ -172,38 +167,22 @@ const createEscrowWizard = new Scenes.WizardScene(
     return ctx.wizard.next();
   },
 
-  // Step 3/9: USD amount prompt
+  // Step 3: USD Amount
   async (ctx) => {
     const currency = ctx.message.text.trim().toUpperCase();
     if (!SYMBOLS[currency]) {
-      return ctx.reply(
-        `*❌ Unsupported coin*\n\n` +
-          `💱  Please choose one of the supported coins \n` +
-          `💰 Supported: ${Object.keys(SYMBOLS).join(" • ")}\n\n` +
-          `🔁 Please try again.`,
-        { parse_mode: "Markdown" },
-      );
+      return ctx.reply(`*❌ Unsupported coin*`, { parse_mode: "Markdown" });
     }
     ctx.wizard.state.escrow.currency = currency;
-
-    await ctx.reply(
-      `🔹 Step 3/9\n\n` +
-        `💵  Enter the amount in USD you wish to trade. \n` +
-        `• (e.g 250)`,
-    );
+    await ctx.reply(`🔹 Step 3/9\n\n💵  Enter the amount in USD you wish to trade.`);
     return ctx.wizard.next();
   },
 
-  // Step 4/9: Fetch price, compute crypto & ID, summary (with manual fallback)
+  // Step 4: Fetch Price & Jump Logic
   async (ctx) => {
     const usdAmount = parseFloat(ctx.message.text.trim());
     if (isNaN(usdAmount) || usdAmount <= 0) {
-      return ctx.reply(
-        `*❌ Invalid USD amount*\n\n` +
-          `ℹ️  Please enter a positive number in USD. \n` +
-          `• (e.g 250)`,
-        { parse_mode: "Markdown" },
-      );
+      return ctx.reply(`*❌ Invalid USD amount*`, { parse_mode: "Markdown" });
     }
 
     const e = ctx.wizard.state.escrow;
@@ -211,174 +190,111 @@ const createEscrowWizard = new Scenes.WizardScene(
 
     try {
       const price = await fetchPriceWithRetry(e.currency, 2);
-      if (!price || typeof price !== "number" || price <= 0) {
-        throw new Error("Invalid price returned");
-      }
       e.cryptoAmount = (usdAmount / price).toFixed(8);
       e.id = Date.now().toString().slice(-6);
 
+      // We send the info and jump directly to Step 5 (Seller Address)
       await ctx.reply(
-        `*📋 Escrow #${e.id}*\n\n.` +
+        `*📋 Escrow #${e.id}*\n\n` +
           `👤 Seller: ${e.sellerHandle}\n` +
-          `💱 Coin: ${e.currency}\n` +
-          `💵 Trade Size: $${e.usdAmount} → ${e.cryptoAmount} ${e.currency}`,
+          `💱 Coin: ${e.currency.replace('_', '\\_')}\n` + // Escaping underscore for Markdown
+          `💵 Trade Size: $${e.usdAmount} → ${e.cryptoAmount} ${e.currency.split('_')[0]}`,
         { parse_mode: "Markdown" },
       );
 
-      await ctx.reply(
-        `🔹 Step 4/9\n\n` +
-          `🏦  Enter the seller’s *on‑chain Deposit address*.`,
-        { parse_mode: "Markdown" },
-      );
-      return ctx.wizard.next();
+      await ctx.reply(`🔹 Step 4/9\n\n🏦 Enter the seller’s *on‑chain Deposit address*.`, { parse_mode: "Markdown" });
+      
+      // CRITICAL: Move cursor to Step 5 (index 5) to avoid Step 4b
+      return ctx.wizard.selectStep(5); 
     } catch (err) {
-      console.error("Price fetch final error:", err.response?.status, err.response?.data || err.message || err);
-
-      // Fallback: ask user to confirm or provide a manual crypto amount
-      await ctx.reply(
-        `*⚠️ Price lookup unavailable*\n\n` +
-          `I couldn't fetch live market prices from external providers due to network or location restrictions.\n\n` +
-          `Please either:\n` +
-          `1. Paste the current *price USD per ${e.currency}* (e.g. 43000) \n` +
-          `or\n` +
-          `2. Paste the *crypto amount* you will deposit (e.g. 0.00543210)\n\n` +
-          `Reply with a number for price or crypto amount.`,
-        { parse_mode: "Markdown" },
-      );
-
-      // set flag to handle manual fallback in next step
+      // Fallback: This triggers the NEXT step (Step 4b)
+      await ctx.reply(`*⚠️ Price lookup unavailable*\nPlease enter crypto amount manually:`, { parse_mode: "Markdown" });
       ctx.wizard.state.awaitingManualPrice = true;
       return ctx.wizard.next();
     }
   },
 
-  // Step 4b/5: Handle manual price or crypto amount then ask for deposit address
+  // Step 4b: Manual Price Fallback
   async (ctx) => {
     const e = ctx.wizard.state.escrow;
-    if (ctx.wizard.state.awaitingManualPrice) {
-      const input = ctx.message.text.trim();
-      const asNumber = parseFloat(input);
-      if (isNaN(asNumber) || asNumber <= 0) {
-        return ctx.reply(
-          `*❌ Invalid number*\n\n` + `Please paste a valid positive number for price or crypto amount.`,
-          { parse_mode: "Markdown" },
-        );
-      }
+    const input = parseFloat(ctx.message.text.trim());
+    if (isNaN(input)) return ctx.reply("Please enter a valid number.");
 
-      // Heuristic: if value > 10 it's probably a USD price per coin; else treat as crypto amount
-      if (asNumber > 10) {
-        // user provided USD price per coin
-        const pricePerCoin = asNumber;
-        e.cryptoAmount = (e.usdAmount / pricePerCoin).toFixed(8);
-        await ctx.reply(
-          `*ℹ️ Manual price used*\n\n` +
-            `Price: $${pricePerCoin} per ${e.currency}\n` +
-            `Computed crypto amount: ${e.cryptoAmount} ${e.currency}`,
-          { parse_mode: "Markdown" },
-        );
-      } else {
-        // user provided crypto amount directly
-        e.cryptoAmount = asNumber.toFixed(8);
-        await ctx.reply(
-          `*ℹ️ Manual crypto amount used*\n\n` +
-            `Using provided crypto amount: ${e.cryptoAmount} ${e.currency}`,
-          { parse_mode: "Markdown" },
-        );
-      }
-
-      e.id = Date.now().toString().slice(-6);
-      // clear manual flag
-      ctx.wizard.state.awaitingManualPrice = false;
+    if (input > 10) {
+      e.cryptoAmount = (e.usdAmount / input).toFixed(8);
+    } else {
+      e.cryptoAmount = input.toFixed(8);
     }
+    e.id = Date.now().toString().slice(-6);
+    ctx.wizard.state.awaitingManualPrice = false;
 
-    await ctx.reply(
-      `🔹 Next step\n\n` + `🏦  Enter the seller’s *on‑chain Deposit address*.`,
-      { parse_mode: "Markdown" },
-    );
+    await ctx.reply(`🏦 Enter the seller’s *on‑chain Deposit address*.`, { parse_mode: "Markdown" });
     return ctx.wizard.next();
   },
 
-  // ... [Keep Steps 1-4 as they are in your code] ...
+  // Step 5: Seller's Deposit Address
+  async (ctx) => {
+    const addr = ctx.message.text.trim();
+    const e = ctx.wizard.state.escrow;
+    const validate = addressValidators[e.currency];
+    
+    if (!validate || !validate(addr)) {
+      return ctx.reply(`*❌ Invalid Address* for ${e.currency}. Try again:`, { parse_mode: "Markdown" });
+    }
+    
+    e.depositAddress = addr;
+    await ctx.reply(`✅ *Seller address saved.*`, { parse_mode: "Markdown" });
 
-// Step 5: Seller’s deposit address
-async (ctx) => {
-  const addr = ctx.message.text.trim();
-  const e = ctx.wizard.state.escrow;
-  const validate = addressValidators[e.currency];
-  
-  if (!validate || !validate(addr)) {
-    return ctx.reply(
-      `*❌ Invalid Address*\n\n` +
-      `🏦 This is not a valid ${e.currency} address. Please try again:`,
-      { parse_mode: "Markdown" }
+    await ctx.reply(`*🔹 Step 5/9*\n\n🏦 Now, enter the *buyer’s Refund address*.`, { parse_mode: "Markdown" });
+    return ctx.wizard.next();
+  },
+
+  // Step 6: Buyer’s Refund Address + Summary
+  async (ctx) => {
+    const addr = ctx.message.text.trim();
+    const e = ctx.wizard.state.escrow;
+    const validate = addressValidators[e.currency];
+    
+    if (!validate || !validate(addr)) {
+      return ctx.reply(`*❌ Invalid Refund Address*. Try again:`, { parse_mode: "Markdown" });
+    }
+    
+    e.refundAddress = addr;
+    await ctx.reply(`✅ *Refund address saved.*`, { parse_mode: "Markdown" });
+
+    const cleanName = e.currency.split('_')[0];
+
+    // USE HTML FOR SUMMARY TO PREVENT UNDERSCORE ERRORS
+    await ctx.reply(
+      `<b>📜 Trade details for Escrow #${e.id}</b>\n\n` +
+        `👤 Seller: ${e.sellerHandle}\n` +
+        `💱 Coin: ${e.currency}\n` +
+        `💵 Trade Size: $${e.usdAmount} → ${e.cryptoAmount} ${cleanName}\n` +
+        `🏦 Seller Receive Addr: <code>${e.depositAddress}</code>\n` +
+        `🏦 Buyer Refund Addr: <code>${e.refundAddress}</code>`,
+      { parse_mode: "HTML" }
     );
-  }
-  
-  e.depositAddress = addr;
-  
-  // FIXED: Explicit confirmation prevents "asking twice" confusion
-  await ctx.reply(`✅ *Seller address saved.*`, { parse_mode: "Markdown" });
 
-  await ctx.reply(
-    `*🔹 Step 5/9*\n\n` + 
-    `🏦 Now, enter the *buyer’s Refund address*.`,
-    { parse_mode: "Markdown" }
-  );
-  return ctx.wizard.next();
-},
+    const systemAddr = depositAddresses[e.currency];
+    await ctx.reply(
+      `🔹 <b>Step 7/9</b>\n\n` +
+        `📤 Please deposit <b>${e.cryptoAmount} ${cleanName}</b> to:\n\n` +
+        `<code>${systemAddr}</code>\n\n` +
+        `⚠️ <b>Network:</b> ${e.currency.includes('TRC20') ? 'TRON (TRC-20)' : 'Ethereum (ERC-20)'}`,
+      { parse_mode: "HTML" }
+    );
+    
+    await ctx.reply(`📥 Once done, paste the *transaction ID (TXID)* below.`, { parse_mode: "Markdown" });
+    return ctx.wizard.next();
+  },
 
-// Step 6: Buyer’s refund address + interim summary
-async (ctx) => {
-  const addr = ctx.message.text.trim();
-  const e = ctx.wizard.state.escrow;
-  const validate = addressValidators[e.currency];
-  
-  if (!validate || !validate(addr)) {
-    return ctx.reply(`*❌ Invalid Refund Address*. Try again:`, { parse_mode: "Markdown" });
-  }
-  
-  e.refundAddress = addr;
-  await ctx.reply(`✅ *Refund address saved.*`, { parse_mode: "Markdown" });
-
-  const cleanName = e.currency.split('_')[0]; // Shows "USDT" instead of "USDT_TRC20"
-  await ctx.reply(
-    `*📜 Trade details for Escrow #${e.id}*\n\n` +
-      `👤 Seller: ${e.sellerHandle}\n` +
-      `💱 Coin: ${e.currency}\n` +
-      `💵 Trade Size: $${e.usdAmount} → ${e.cryptoAmount} ${cleanName}\n` +
-      `🏦 Seller Receive Addr: \`${e.depositAddress}\`\n` +
-      `🏦 Buyer Refund Addr: \`${e.refundAddress}\`\n`,
-    { parse_mode: "Markdown" }
-  );
-
-  const systemAddr = depositAddresses[e.currency];
-  await ctx.reply(
-    `🔹 Step 7/9\n\n` +
-      `📤 Please deposit *${e.cryptoAmount} ${cleanName}* to:\n\n` +
-      `<code>${systemAddr}</code>\n\n` +
-      `⚠️ *Network:* ${e.currency.includes('TRC20') ? 'TRON (TRC-20)' : 'Ethereum (ERC-20)'}`,
-    { parse_mode: "HTML" } // HTML allows the <code> tag for tap-to-copy
-  );
-  
-  await ctx.reply(`📥 Once done, paste the *transaction ID (TXID)* below.`, {
-    parse_mode: "Markdown",
-  });
-  return ctx.wizard.next();
-},
-
-// ... [Keep the rest of the steps as they are] ...
-  // Step 7/9: TXID entry
+  // Step 7: TXID
   async (ctx) => {
     const txid = ctx.message.text.trim();
     if (!/^[A-Fa-f0-9]{6,}$/.test(txid)) {
-      return ctx.reply(
-        `*❌ Invalid TXID*\n\n` + `🔗 Please paste the full transaction hash`,
-        { parse_mode: "Markdown" },
-      );
+      return ctx.reply(`*❌ Invalid TXID*`, { parse_mode: "Markdown" });
     }
     ctx.wizard.state.escrow.txid = txid;
-
-    // Persist final escrow
     if (!ctx.session.escrows) ctx.session.escrows = {};
     ctx.session.escrows[ctx.chat.id] = ctx.wizard.state.escrow;
 
@@ -386,22 +302,22 @@ async (ctx) => {
     return ctx.wizard.next();
   },
 
-  // Step 8/9: Final confirmation summary
+  // Step 8: Final Confirmation
   async (ctx) => {
     const e = ctx.wizard.state.escrow;
     await ctx.reply(
       `*🛡️ Escrow #${e.id} Complete!*\n\n` +
         `👤 Seller: ${e.sellerHandle}\n` +
-        `💱 Coin: ${e.currency}\n` +
-        `💵 Trade Size: $${e.usdAmount} → ${e.cryptoAmount} ${e.currency}\n` +
-        `🏦 Deposit Addr: ${e.depositAddress}\n` +
-        `🏦 Refund Addr: ${e.refundAddress}\n` +
-        `🔗 TXID: ${e.txid}`,
+        `💱 Coin: ${e.currency.replace('_', '\\_')}\n` + 
+        `💵 Trade Size: $${e.usdAmount} → ${e.cryptoAmount} ${e.currency.split('_')[0]}\n` +
+        `🔗 TXID: \`${e.txid}\``,
       { parse_mode: "Markdown" },
     );
     return ctx.scene.leave();
-  },
+  }
 );
+
+// ... [Keep Cancel command and export as is] ...
 
 // scene-level cancel handler
 createEscrowWizard.command("cancel", async (ctx) => {
