@@ -7,7 +7,9 @@ const { depositAddresses, addressValidators } = require("./config");
 const SYMBOLS = {
   BTC: { binance: "BTCUSDT", coincap: "bitcoin", coinpaprika: "btc-bitcoin", coingecko: "bitcoin" },
   ETH: { binance: "ETHUSDT", coincap: "ethereum", coinpaprika: "eth-ethereum", coingecko: "ethereum" },
-  USDT: { binance: "USDTUSDT", coincap: "tether", coinpaprika: "usdt-tether", coingecko: "tether" },
+  // Distinguish USDT by Network
+  USDT_TRC20: { binance: "USDTUSDT", coincap: "tether", coinpaprika: "usdt-tether", coingecko: "tether" },
+  USDT_ERC20: { binance: "USDTUSDT", coincap: "tether", coinpaprika: "usdt-tether", coingecko: "tether" },
   TRX: { binance: "TRXUSDT", coincap: "tron", coinpaprika: "trx-tron", coingecko: "tron" },
   LTC: { binance: "LTCUSDT", coincap: "litecoin", coinpaprika: "ltc-litecoin", coingecko: "litecoin" },
   XRP: { binance: "XRPUSDT", coincap: "ripple", coinpaprika: "xrp-xrp", coingecko: "ripple" },
@@ -296,63 +298,75 @@ const createEscrowWizard = new Scenes.WizardScene(
     return ctx.wizard.next();
   },
 
-  // Step 5/9: Seller’s deposit address
-  async (ctx) => {
-    const addr = ctx.message.text.trim();
-    const validate = addressValidators[ctx.wizard.state.escrow.currency];
-    if (!validate(addr)) {
-      return ctx.reply(
-        `*❌ Invalid Deposit Address*\n\n` +
-          `🏦 Please try again with a valid on‑chain address`,
-        { parse_mode: "Markdown" },
-      );
-    }
-    ctx.wizard.state.escrow.depositAddress = addr;
+  // ... [Keep Steps 1-4 as they are in your code] ...
 
-    await ctx.reply(
-      `*🔹 Step 5/9*\n\n` + `🏦  Enter the buyer’s *Refund address*. \n`,
-      { parse_mode: "Markdown" },
+// Step 5: Seller’s deposit address
+async (ctx) => {
+  const addr = ctx.message.text.trim();
+  const e = ctx.wizard.state.escrow;
+  const validate = addressValidators[e.currency];
+  
+  if (!validate || !validate(addr)) {
+    return ctx.reply(
+      `*❌ Invalid Address*\n\n` +
+      `🏦 This is not a valid ${e.currency} address. Please try again:`,
+      { parse_mode: "Markdown" }
     );
-    return ctx.wizard.next();
-  },
+  }
+  
+  e.depositAddress = addr;
+  
+  // FIXED: Explicit confirmation prevents "asking twice" confusion
+  await ctx.reply(`✅ *Seller address saved.*`, { parse_mode: "Markdown" });
 
-  // Step 6/9: Buyer’s refund address + interim summary
-  async (ctx) => {
-    const addr = ctx.message.text.trim();
-    const validate = addressValidators[ctx.wizard.state.escrow.currency];
-    if (!validate(addr)) {
-      return ctx.reply(
-        `*❌ Invalid Refund Address*\n\n` +
-          `🏦 Please try again with a valid on‑chain address`,
-        { parse_mode: "Markdown" },
-      );
-    }
-    ctx.wizard.state.escrow.refundAddress = addr;
+  await ctx.reply(
+    `*🔹 Step 5/9*\n\n` + 
+    `🏦 Now, enter the *buyer’s Refund address*.`,
+    { parse_mode: "Markdown" }
+  );
+  return ctx.wizard.next();
+},
 
-    const e = ctx.wizard.state.escrow;
-    await ctx.reply(
-      `*📜 Trade details for Escrow #${e.id}*\n\n.` +
-        `👤 Seller: ${e.sellerHandle}\n` +
-        `💱 Coin: ${e.currency}\n` +
-        `💵 Trade Size: $${e.usdAmount} → ${e.cryptoAmount} ${e.currency}\n` +
-        `🏦 Deposit Address: ${e.depositAddress}\n` +
-        `🏦 Refund Address: ${e.refundAddress}\n`,
-      { parse_mode: "Markdown" },
-    );
+// Step 6: Buyer’s refund address + interim summary
+async (ctx) => {
+  const addr = ctx.message.text.trim();
+  const e = ctx.wizard.state.escrow;
+  const validate = addressValidators[e.currency];
+  
+  if (!validate || !validate(addr)) {
+    return ctx.reply(`*❌ Invalid Refund Address*. Try again:`, { parse_mode: "Markdown" });
+  }
+  
+  e.refundAddress = addr;
+  await ctx.reply(`✅ *Refund address saved.*`, { parse_mode: "Markdown" });
 
-    const systemAddr = depositAddresses[e.currency];
-    await ctx.reply(
-      `🔹 Step 7/9\n\n` +
-        `📤 Please deposit *${e.cryptoAmount} ${e.currency}* to:\n\n` +
-        `🏦 ${systemAddr}`,
-      { parse_mode: "Markdown" },
-    );
-    await ctx.reply(`📥 Once done, paste the *transaction ID (TXID)* below.`, {
-      parse_mode: "Markdown",
-    });
-    return ctx.wizard.next();
-  },
+  const cleanName = e.currency.split('_')[0]; // Shows "USDT" instead of "USDT_TRC20"
+  await ctx.reply(
+    `*📜 Trade details for Escrow #${e.id}*\n\n` +
+      `👤 Seller: ${e.sellerHandle}\n` +
+      `💱 Coin: ${e.currency}\n` +
+      `💵 Trade Size: $${e.usdAmount} → ${e.cryptoAmount} ${cleanName}\n` +
+      `🏦 Seller Receive Addr: \`${e.depositAddress}\`\n` +
+      `🏦 Buyer Refund Addr: \`${e.refundAddress}\`\n`,
+    { parse_mode: "Markdown" }
+  );
 
+  const systemAddr = depositAddresses[e.currency];
+  await ctx.reply(
+    `🔹 Step 7/9\n\n` +
+      `📤 Please deposit *${e.cryptoAmount} ${cleanName}* to:\n\n` +
+      `<code>${systemAddr}</code>\n\n` +
+      `⚠️ *Network:* ${e.currency.includes('TRC20') ? 'TRON (TRC-20)' : 'Ethereum (ERC-20)'}`,
+    { parse_mode: "HTML" } // HTML allows the <code> tag for tap-to-copy
+  );
+  
+  await ctx.reply(`📥 Once done, paste the *transaction ID (TXID)* below.`, {
+    parse_mode: "Markdown",
+  });
+  return ctx.wizard.next();
+},
+
+// ... [Keep the rest of the steps as they are] ...
   // Step 7/9: TXID entry
   async (ctx) => {
     const txid = ctx.message.text.trim();
