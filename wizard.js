@@ -7,7 +7,6 @@ const { depositAddresses, addressValidators } = require("./config");
 const SYMBOLS = {
   BTC: { binance: "BTCUSDT", coincap: "bitcoin", coinpaprika: "btc-bitcoin", coingecko: "bitcoin" },
   ETH: { binance: "ETHUSDT", coincap: "ethereum", coinpaprika: "eth-ethereum", coingecko: "ethereum" },
-  // Distinguish USDT by Network
   USDT_TRC20: { binance: "USDTUSDT", coincap: "tether", coinpaprika: "usdt-tether", coingecko: "tether" },
   USDT_ERC20: { binance: "USDTUSDT", coincap: "tether", coinpaprika: "usdt-tether", coingecko: "tether" },
   TRX: { binance: "TRXUSDT", coincap: "tron", coinpaprika: "trx-tron", coingecko: "tron" },
@@ -18,79 +17,59 @@ const SYMBOLS = {
   DOGE: { binance: "DOGEUSDT", coincap: "dogecoin", coinpaprika: "doge-dogecoin", coingecko: "dogecoin" },
 };
 
-// Simple in-memory short cache to reduce API calls
-const priceCache = {}; // { key: { price: number, ts: epoch_ms } }
-const CACHE_TTL = 30 * 1000; // 30 seconds
+// Map internal currency keys to human-readable Network names
+const NETWORK_NAMES = {
+  BTC: "Bitcoin Network",
+  ETH: "Ethereum (ERC-20)",
+  USDT_TRC20: "TRON (TRC-20)",
+  USDT_ERC20: "Ethereum (ERC-20)",
+  TRX: "TRON (TRC-20)",
+  LTC: "Litecoin Network",
+  XRP: "Ripple (XRP)",
+  TON: "The Open Network (TON)",
+  SOL: "Solana Network",
+  DOGE: "Dogecoin Network",
+};
 
-// Environment-configurable API keys (optional)
-const COINPAPRIKA_KEY = process.env.COINPAPRIKA_KEY || null; // coinpaprika optional
-const COINGECKO_KEY = process.env.COINGECKO_KEY || null; // coingecko optional (if on paid plan)
-// Note: Binance & CoinCap public endpoints used without keys; if blocked, use a keyed provider.
+const priceCache = {};
+const CACHE_TTL = 30 * 1000;
+const COINPAPRIKA_KEY = process.env.COINPAPRIKA_KEY || null;
+const COINGECKO_KEY = process.env.COINGECKO_KEY || null;
 
+// --- API Helper Functions ---
 async function tryBinance(pair) {
-  if (!pair) throw new Error("Missing binance pair");
   const url = `https://api.binance.com/api/v3/ticker/price`;
-  const params = { symbol: pair };
-  const { data } = await axios.get(url, { params, timeout: 5000, headers: { "User-Agent": "EscrowBot/1.0" } });
-  if (!data || typeof data.price === "undefined") throw new Error("Invalid Binance response");
-  const p = parseFloat(data.price);
-  if (!p || isNaN(p) || p <= 0) throw new Error("Invalid price from Binance");
-  return p;
+  const { data } = await axios.get(url, { params: { symbol: pair }, timeout: 5000 });
+  return parseFloat(data.price);
 }
 
 async function tryCoinCap(id) {
-  if (!id) throw new Error("Missing coincap id");
-  const url = `https://api.coincap.io/v2/assets/${encodeURIComponent(id)}`;
-  const { data } = await axios.get(url, { timeout: 5000, headers: { "User-Agent": "EscrowBot/1.0" } });
-  if (!data || !data.data || typeof data.data.priceUsd === "undefined") throw new Error("Invalid CoinCap response");
-  const p = parseFloat(data.data.priceUsd);
-  if (!p || isNaN(p) || p <= 0) throw new Error("Invalid price from CoinCap");
-  return p;
+  const url = `https://api.coincap.io/v2/assets/${id}`;
+  const { data } = await axios.get(url, { timeout: 5000 });
+  return parseFloat(data.data.priceUsd);
 }
 
 async function tryCoinGecko(id) {
-  if (!id) throw new Error("Missing coingecko id");
   const url = "https://api.coingecko.com/api/v3/simple/price";
   const params = { ids: id, vs_currencies: "usd" };
-  const headers = { "User-Agent": "EscrowBot/1.0" };
-  if (COINGECKO_KEY) headers["x-cg-pro-api-key"] = COINGECKO_KEY;
+  const headers = COINGECKO_KEY ? { "x-cg-pro-api-key": COINGECKO_KEY } : {};
   const { data } = await axios.get(url, { params, timeout: 5000, headers });
-  if (!data || !data[id] || typeof data[id].usd !== "number") throw new Error("Invalid CoinGecko response");
-  const p = data[id].usd;
-  if (!p || isNaN(p) || p <= 0) throw new Error("Invalid price from CoinGecko");
-  return p;
+  return data[id].usd;
 }
 
 async function tryCoinPaprika(id) {
-  if (!id) throw new Error("Missing coinpaprika id");
-  const url = `https://api.coinpaprika.com/v1/tickers/${encodeURIComponent(id)}`;
-  const headers = { "User-Agent": "EscrowBot/1.0" };
-  if (COINPAPRIKA_KEY) headers["X-API-Key"] = COINPAPRIKA_KEY;
+  const url = `https://api.coinpaprika.com/v1/tickers/${id}`;
+  const headers = COINPAPRIKA_KEY ? { "X-API-Key": COINPAPRIKA_KEY } : {};
   const { data } = await axios.get(url, { timeout: 5000, headers });
-  if (!data || !data.quotes || !data.quotes.USD || typeof data.quotes.USD.price === "undefined") throw new Error("Invalid CoinPaprika response");
-  const p = parseFloat(data.quotes.USD.price);
-  if (!p || isNaN(p) || p <= 0) throw new Error("Invalid price from CoinPaprika");
-  return p;
+  return parseFloat(data.quotes.USD.price);
 }
 
-// Multi-provider fetch with caching, retries, backoff, and provider fallbacks
 async function fetchPriceWithRetry(symbol, attemptsPerProvider = 2) {
-  if (!symbol) throw new Error("Missing symbol");
-  if (!SYMBOLS[symbol]) throw new Error(`Unsupported symbol ${symbol}`);
-
-  // Stablecoin shortcut
   if (symbol === "USDT") return 1;
-
   const map = SYMBOLS[symbol];
   const cacheKey = `price:${symbol}`;
-  const now = Date.now();
-  const cached = priceCache[cacheKey];
-  if (cached && now - cached.ts < CACHE_TTL) {
-    console.log(`Using cached price for ${symbol}: ${cached.price}`);
-    return cached.price;
-  }
+  if (priceCache[cacheKey] && Date.now() - priceCache[cacheKey].ts < CACHE_TTL) return priceCache[cacheKey].price;
 
-  // Providers in priority order; each provider will be tried with limited retries
   const providers = [
     { name: "binance", fn: () => tryBinance(map.binance) },
     { name: "coincap", fn: () => tryCoinCap(map.coincap) },
@@ -98,81 +77,55 @@ async function fetchPriceWithRetry(symbol, attemptsPerProvider = 2) {
     { name: "coinpaprika", fn: () => tryCoinPaprika(map.coinpaprika) },
   ];
 
-  let lastErr = null;
   for (const provider of providers) {
-    for (let attempt = 0; attempt < attemptsPerProvider; attempt++) {
+    for (let i = 0; i < attemptsPerProvider; i++) {
       try {
         const p = await provider.fn();
-        if (!p || isNaN(p) || p <= 0) throw new Error(`Invalid price from ${provider.name}`);
-        priceCache[cacheKey] = { price: p, ts: Date.now() };
-        console.log(`Price for ${symbol} from ${provider.name}: ${p}`);
-        return p;
+        if (p > 0) {
+          priceCache[cacheKey] = { price: p, ts: Date.now() };
+          return p;
+        }
       } catch (err) {
-        lastErr = err;
-        const status = err.response?.status;
-        const info = err.response?.data || err.message || err;
-        console.error(`${provider.name} attempt ${attempt + 1} failed for ${symbol}:`, status || "", info);
-        if (status === 451 || status === 403) {
-          // blocked/restricted location for this provider: stop trying this provider immediately
-          console.warn(`${provider.name} blocked for ${symbol} (status ${status}), moving to next provider`);
-          break;
-        }
-        if (status === 429) {
-          // rate limited: move to next provider
-          console.warn(`${provider.name} rate limited, moving to next provider`);
-          break;
-        }
-        // exponential backoff between attempts on same provider
-        const backoff = 200 * Math.pow(2, attempt);
-        await new Promise((res) => setTimeout(res, backoff));
+        if (err.response?.status === 429 || err.response?.status === 451) break;
+        await new Promise(r => setTimeout(r, 200 * Math.pow(2, i)));
       }
     }
   }
-
-  // If all providers fail, throw the last error so caller can handle it
-  // The wizard will fall back to asking the user for a manual confirmation/price.
-  throw lastErr || new Error("All providers failed");
+  throw new Error("Price lookup failed");
 }
 
-// ... [Keep all imports, SYMBOLS, and fetch functions exactly as they are] ...
-
-// ... (Keep all your SYMBOLS, provider functions, and fetchPriceWithRetry as they are) ...
-
+// --- WIZARD SCENE ---
 const createEscrowWizard = new Scenes.WizardScene(
   "create-escrow",
 
-  // STEP 0 (Index 0): Seller Handle
+  // 1. Seller Handle
   async (ctx) => {
     await ctx.reply(`*🔹 Step 1/9*\n\n🏷️ Enter the *seller’s Telegram username* (e.g. @johndoe)`, { parse_mode: "Markdown" });
     return ctx.wizard.next();
   },
 
-  // STEP 1 (Index 1): Coin Symbol
+  // 2. Currency
   async (ctx) => {
     const handle = ctx.message.text.trim();
-    if (!/^@[A-Za-z0-9_]{5,32}$/.test(handle)) {
-      return ctx.reply(`*❌ Invalid Handle. Try again:*`, { parse_mode: "Markdown" });
-    }
+    if (!/^@[A-Za-z0-9_]{5,32}$/.test(handle)) return ctx.reply(`*❌ Invalid Handle.*`);
     ctx.wizard.state.escrow = { sellerHandle: handle };
-    await ctx.reply(`*🔹 Step 2/9*\n\n💰 Enter the coin currency:\n*${Object.keys(SYMBOLS).join(" • ")}*`, { parse_mode: "Markdown" });
+    await ctx.reply(`*🔹 Step 2/9*\n\n💰 Select Currency:\n*${Object.keys(SYMBOLS).join(" • ")}*`, { parse_mode: "Markdown" });
     return ctx.wizard.next();
   },
 
-  // STEP 2 (Index 2): USD Amount
+  // 3. USD Amount
   async (ctx) => {
     const currency = ctx.message.text.trim().toUpperCase();
-    if (!SYMBOLS[currency]) {
-      return ctx.reply(`*❌ Unsupported coin. Try again:*`, { parse_mode: "Markdown" });
-    }
+    if (!SYMBOLS[currency]) return ctx.reply(`*❌ Unsupported coin.*`);
     ctx.wizard.state.escrow.currency = currency;
-    await ctx.reply(`🔹 Step 3/9\n\n💵 Enter the amount in USD:`);
+    await ctx.reply(`🔹 Step 3/9\n\n💵 Enter the trade amount in USD:`);
     return ctx.wizard.next();
   },
 
-  // STEP 3 (Index 3): Price Fetching Logic
+  // 4. Price Logic & Automated Jump
   async (ctx) => {
     const usdAmount = parseFloat(ctx.message.text.trim());
-    if (isNaN(usdAmount) || usdAmount <= 0) return ctx.reply(`*❌ Invalid USD amount*`, { parse_mode: "Markdown" });
+    if (isNaN(usdAmount) || usdAmount <= 0) return ctx.reply(`*❌ Invalid USD amount.*`);
 
     const e = ctx.wizard.state.escrow;
     e.usdAmount = usdAmount;
@@ -182,79 +135,69 @@ const createEscrowWizard = new Scenes.WizardScene(
       e.cryptoAmount = (usdAmount / price).toFixed(8);
       e.id = Date.now().toString().slice(-6);
 
-      // We found the price, tell the user and jump to Seller Address Prompt (Step Index 5)
       await ctx.reply(
-        `✅ *Price Found*\n` +
-        `💱 1 ${e.currency.replace('_', '\\_')} = $${price.toLocaleString()}\n` +
-        `💰 Total: *${e.cryptoAmount}*`,
-        { parse_mode: "Markdown" }
+        `✅ <b>Price Calculated</b>\n` +
+        `💱 1 ${e.currency} = $${price.toLocaleString()}\n` +
+        `💰 You will deposit: <b>${e.cryptoAmount}</b>`, 
+        { parse_mode: "HTML" }
       );
 
-      await ctx.reply(`🔹 Step 4/9\n\n🏦 Enter the *seller’s* Deposit address:`, { parse_mode: "Markdown" });
-      
-      // JUMP past the manual fallback step
-      return ctx.wizard.selectStep(5); 
+      await ctx.reply(`🔹 Step 4/9\n\n🏦 Enter the <b>seller’s</b> deposit address:`, { parse_mode: "HTML" });
+      return ctx.wizard.selectStep(5); // Jump directly to Step 5 Handler, skipping Manual Fallback
     } catch (err) {
-      // No price found, triggers Step 4 (Index 4)
-      await ctx.reply(`*⚠️ Price lookup failed*\n\nPlease enter the *crypto amount* manually:`, { parse_mode: "Markdown" });
+      await ctx.reply(`*⚠️ Market price unavailable.*\n\nPlease paste the *crypto amount* you will deposit manually:`, { parse_mode: "Markdown" });
       ctx.wizard.state.awaitingManualPrice = true;
       return ctx.wizard.next();
     }
   },
 
-  // STEP 4 (Index 4): Manual Fallback (Only runs if Step 3 fails)
+  // 5. Manual Fallback (Only runs if Step 4 fails)
   async (ctx) => {
     const e = ctx.wizard.state.escrow;
     const input = parseFloat(ctx.message.text.trim());
-    if (isNaN(input)) return ctx.reply("Please enter a valid number.");
+    if (isNaN(input)) return ctx.reply("Invalid input. Try again.");
 
     e.cryptoAmount = (input > 10) ? (e.usdAmount / input).toFixed(8) : input.toFixed(8);
     e.id = Date.now().toString().slice(-6);
     ctx.wizard.state.awaitingManualPrice = false;
 
-    await ctx.reply(`🔹 Step 4/9\n\n🏦 Enter the *seller’s* Deposit address:`, { parse_mode: "Markdown" });
+    await ctx.reply(`🔹 Step 4/9\n\n🏦 Enter the <b>seller’s</b> deposit address:`, { parse_mode: "HTML" });
     return ctx.wizard.next();
   },
 
-  // STEP 5 (Index 5): Seller Address Handler
+  // 6. Seller Address Handler
   async (ctx) => {
     const addr = ctx.message.text.trim();
     const e = ctx.wizard.state.escrow;
     const validate = addressValidators[e.currency];
     
-    if (!validate || !validate(addr)) {
-      return ctx.reply(`*❌ Invalid Address* for ${e.currency.replace('_', '\\_')}. Try again:`, { parse_mode: "Markdown" });
-    }
+    if (!validate || !validate(addr)) return ctx.reply(`*❌ Invalid Address* for this currency. Try again:`, { parse_mode: "Markdown" });
     
     e.depositAddress = addr;
     await ctx.reply(`✅ *Seller address saved.*`);
-    await ctx.reply(`*🔹 Step 5/9*\n\n🏦 Enter the *buyer’s* Refund address:`, { parse_mode: "Markdown" });
+    await ctx.reply(`*🔹 Step 5/9*\n\n🏦 Now, enter the <b>buyer’s</b> refund address:`, { parse_mode: "HTML" });
     return ctx.wizard.next();
   },
 
-  // STEP 6 (Index 6): Buyer Address & Summary (CRITICAL HTML FIX)
+  // 7. Buyer Address & Detailed Summary
   async (ctx) => {
     const addr = ctx.message.text.trim();
     const e = ctx.wizard.state.escrow;
     const validate = addressValidators[e.currency];
     
-    if (!validate || !validate(addr)) {
-      return ctx.reply(`*❌ Invalid Refund Address*. Try again:`, { parse_mode: "Markdown" });
-    }
+    if (!validate || !validate(addr)) return ctx.reply(`*❌ Invalid Refund Address*. Try again:`, { parse_mode: "Markdown" });
     
     e.refundAddress = addr;
-    await ctx.reply(`✅ *Refund address saved.*`);
-
     const cleanName = e.currency.split('_')[0];
     const systemAddr = depositAddresses[e.currency];
+    const networkName = NETWORK_NAMES[e.currency] || "Main Network";
 
-    // Using HTML to prevent the USDT_TRC20 underscore crash
     await ctx.reply(
       `<b>📜 Trade details for Escrow #${e.id}</b>\n\n` +
       `👤 Seller: ${e.sellerHandle}\n` +
       `💱 Coin: ${e.currency}\n` +
-      `💵 Trade Size: $${e.usdAmount} → ${e.cryptoAmount} ${cleanName}\n` +
-      `🏦 Seller Receive: <code>${e.depositAddress}</code>\n` +
+      `💵 Size: $${e.usdAmount} → ${e.cryptoAmount} ${cleanName}\n` +
+      `🏦 Seller Address: <code>${e.depositAddress}</code>\n` +
       `🏦 Buyer Refund: <code>${e.refundAddress}</code>`,
       { parse_mode: "HTML" }
     );
@@ -263,17 +206,17 @@ const createEscrowWizard = new Scenes.WizardScene(
       `🔹 <b>Step 7/9</b>\n\n` +
       `📤 Please deposit <b>${e.cryptoAmount} ${cleanName}</b> to:\n\n` +
       `<code>${systemAddr}</code>\n\n` +
-      `⚠️ <b>Network:</b> ${e.currency.includes('TRC20') ? 'TRON (TRC-20)' : 'Ethereum (ERC-20)'}\n\n` +
+      `⚠️ <b>Network:</b> ${networkName}\n\n` +
       `📥 Once done, paste the <b>TXID</b> below.`,
       { parse_mode: "HTML" }
     );
     return ctx.wizard.next();
   },
 
-  // STEP 7 (Index 7): TXID Entry
+  // 8. TXID Entry
   async (ctx) => {
     const txid = ctx.message.text.trim();
-    if (txid.length < 8) return ctx.reply(`*❌ Invalid TXID*`, { parse_mode: "Markdown" });
+    if (txid.length < 8) return ctx.reply(`*❌ Invalid TXID format.*`);
     
     ctx.wizard.state.escrow.txid = txid;
     if (!ctx.session.escrows) ctx.session.escrows = {};
@@ -283,12 +226,13 @@ const createEscrowWizard = new Scenes.WizardScene(
     return ctx.wizard.next();
   },
 
-  // STEP 8 (Index 8): Final Success
+  // 9. Final Success
   async (ctx) => {
     const e = ctx.wizard.state.escrow;
     await ctx.reply(
       `<b>🛡️ Escrow #${e.id} Complete!</b>\n\n` +
       `👤 Seller: ${e.sellerHandle}\n` +
+      `💱 Coin: ${e.currency}\n` +
       `🔗 TXID: <code>${e.txid}</code>`,
       { parse_mode: "HTML" }
     );
@@ -296,7 +240,6 @@ const createEscrowWizard = new Scenes.WizardScene(
   }
 );
 
-// scene-level cancel handler
 createEscrowWizard.command("cancel", async (ctx) => {
   await ctx.reply(
     `*🛑 Operation Canceled* \n` +
