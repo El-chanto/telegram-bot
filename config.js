@@ -21,9 +21,11 @@ module.exports = {
     // Ethereum mainnet (~0x + 40 hex)
     ETH: (addr) => /^0x[a-fA-F0-9]{40}$/.test(addr),
 
-    // USDT on TRON (TRC-20) 
+    /* // USDT on TRON (TRC-20) 
     // Starts with 'T', followed by 33 alphanumeric characters (excluding 0, O, I, l)
-    USDT_TRC20: (addr) => /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(addr),
+    USDT_TRC20: (addr) => /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(addr), */
+    // USDT on Ethereum (ERC-20) same format as ETH
+    USDT: (addr) => /^0x[a-fA-F0-9]{40}$/.test(addr),
 
     // Tron mainnet (base58, starts with T, 34 chars)
     TRX: (addr) => /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(addr),
