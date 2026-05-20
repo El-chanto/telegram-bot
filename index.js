@@ -75,7 +75,7 @@ bot.command("release", (ctx) => {
     );
   }
   // TODO: implement real release logic
-  return ctx.reply("🔓 Release flow is coming soon.");
+  return ctx.reply(`🔒 Escrow #${e.id} \n has been released to` + `${e.sellerHandle}\n` + `and the address ${e.depositAddress}\n`);
 });
 
 // 7) /refund — stub that checks for an escrow first
