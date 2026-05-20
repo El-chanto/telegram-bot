@@ -157,7 +157,7 @@ const createEscrowWizard = new Scenes.WizardScene(
   async (ctx) => {
     await ctx.reply(
       `*🔹 Step 1/8*\n\n` +
-        `🏷️  Enter the *seller’s Telegram username*. \n` +
+        `🏷️  Enter *seller’s telegram username*. \n` +
         `• Must start with @ (e.g. @johndoe)`,
       { parse_mode: "Markdown" },
     );
@@ -239,7 +239,7 @@ const createEscrowWizard = new Scenes.WizardScene(
       );
 
       await ctx.reply(
-        `🔹 Step 4/8\n\n🏦 Enter the *seller’s Deposit address*:`,
+        `🔹 Step 4/8\n\n🏦 Enter *seller’s receiving address*:`,
         { parse_mode: "Markdown" },
       );
       return ctx.wizard.selectStep(5); // Jump past manual fallback
@@ -266,7 +266,7 @@ const createEscrowWizard = new Scenes.WizardScene(
     ctx.wizard.state.awaitingManualPrice = false;
 
     await ctx.reply(
-      `🔹 Step 4/8\n\n🏦 Enter the *seller’s Deposit address*:`,
+      `🔹 Step 4/8\n\n🏦 Enter *seller’s receiving address*:`,
       {
         parse_mode: "Markdown",
       },
@@ -282,15 +282,15 @@ const createEscrowWizard = new Scenes.WizardScene(
 
     if (!validate || !validate(addr))
       return ctx.reply(
-        `*❌ Invalid Deposit Address*\n\n` +
+        `*❌ Invalid receiving address*\n\n` +
           `🏦 Please try again with a valid on‑chain address`,
         { parse_mode: "Markdown" },
       );
 
     e.depositAddress = addr;
-    await ctx.reply(`✅ *Seller address saved.*`, { parse_mode: "Markdown" });
+    await ctx.reply(`✅ *Seller receiving address saved.*`, { parse_mode: "Markdown" });
     await ctx.reply(
-      `*🔹 Step 5/8*\n\n` + `🏦  Enter the *buyer’s Refund address*. \n`,
+      `*🔹 Step 5/8*\n\n` + `🏦  Enter *buyer’s refund address*. \n`,
       { parse_mode: "Markdown" },
     );
     return ctx.wizard.next();
@@ -304,7 +304,7 @@ const createEscrowWizard = new Scenes.WizardScene(
 
     if (!validate || !validate(addr))
       return ctx.reply(
-        `*❌ Invalid Refund Address*\n\n` +
+        `*❌ Invalid refund address*\n\n` +
           `🏦 Please try again with a valid on‑chain address`,
         { parse_mode: "Markdown" },
       );
